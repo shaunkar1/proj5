@@ -16,6 +16,9 @@ Each difference is reported as a "site":
                             code that runs at import time at module level
   ("enter", first)          a default value or annotation of a function defined at
                             class or module level: seen by calls of that function
+  ("swap", line, col, site) only with keep_swaps: an `is` comparison at line/col
+                            rewritten as `==` (or `is not` as `!=`); `site` is what
+                            would be reported otherwise
 
 An empty list means the two files compile to the same program.
 """
@@ -138,7 +141,24 @@ def assigned_names(statement):
     return None
 
 
+def _identity_to_equality(a, b):
+    """`x is y` rewritten as `x == y`, or `x is not y` as `x != y`, operands untouched."""
+    if not (isinstance(a, ast.Compare) and isinstance(b, ast.Compare)):
+        return False
+    if len(a.ops) != 1 or len(b.ops) != 1 or len(a.comparators) != 1 or len(b.comparators) != 1:
+        return False
+    kinds = (type(a.ops[0]), type(b.ops[0]))
+    if kinds not in ((ast.Is, ast.Eq), (ast.IsNot, ast.NotEq)):
+        return False
+    return _same(a.left, b.left) and _same(a.comparators[0], b.comparators[0])
+
+
 def _walk(a, b, path, out):
+    if _identity_to_equality(a, b):
+        # reported with the place of the comparison, so that what its operands
+        # are at run time can be looked up (see analyze.py)
+        out.append(("swap", a.lineno, a.col_offset, _site(path + [(a, None)], False)))
+        return
     if type(a) is not type(b):
         out.append(_site(path + [(a, None)], isinstance(a, _BLOCKS)))
         return
@@ -184,7 +204,7 @@ def _drop_docstrings(tree):
                 node.body[0] = ast.copy_location(ast.Pass(), first)
 
 
-def diff(old_source, new_source):
+def diff(old_source, new_source, keep_swaps=False):
     """Sites where the two sources differ.  Raises SyntaxError when the new
     source does not parse (ValueError for null bytes is turned into one)."""
     old_tree = ast.parse(old_source)
@@ -216,6 +236,8 @@ def diff(old_source, new_source):
         _LINES[0] = _LINES[1] = None
     seen = []
     for site in out:
+        if site[0] == "swap" and not keep_swaps:
+            site = site[3]
         if site not in seen:
             seen.append(site)
     return seen

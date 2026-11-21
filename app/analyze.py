@@ -171,6 +171,15 @@ class Maps:
         self.view = View(len(self.ids), data["files"], data["inst"], refs, data.get("late_files"), data.get("inst_early"))
         self.all = self.view.all
         # per-query views of the long TPC tests: method -> (View, cpu seconds per query, fixed cpu)
+        # comparison place -> kinds of operands seen there (tools/swapmap.py)
+        self.swaps = {}
+        try:
+            import json
+
+            with open(os.path.join(os.path.dirname(path), "swaps.json")) as handle:
+                self.swaps = json.load(handle)
+        except Exception:
+            self.swaps = {}
         self.queries = {}
         for method, sub in data.get("queries", {}).items():
             self.queries[method] = (View(sub["n"], sub["files"], sub["inst"], refs), sub["cpu"], sub["base_cpu"])
@@ -374,10 +383,17 @@ def _analyze(maps, patch_bytes, repo):
         plan.blind_all = True
         plan.notes.append("no file patches found")
         return plan
+    harmless = _harmless_rewrites(maps, file_patches, repo)
     for fp in file_patches:
         before = plan.cands
         plan.cands = 0
-        _one_file(maps, plan, fp, repo)
+        if (fp.new or fp.old) in harmless:
+            path = fp.new or fp.old
+            plan.touched.add(path)
+            plan.files[path] = harmless[path][0]
+            plan.notes.append("%s: identity comparison rewritten as equality at line %s: same result for every operand seen there" % (path, ", ".join(map(str, harmless[path][1]))))
+        else:
+            _one_file(maps, plan, fp, repo)
         path = fp.new or fp.old
         simple_fixture = (
             path.startswith("tests/fixtures/")
@@ -390,6 +406,76 @@ def _analyze(maps, patch_bytes, repo):
             plan.other_mask |= plan.cands
         plan.cands |= before
     return plan
+
+
+def _same_result(pair):
+    """Do `x is y` and `x == y` agree for operands of these kinds?  pair is
+    (type of x, class defining its __eq__, x is an Enum member, the same for y),
+    as recorded for one comparison over the whole suite at the pinned commit."""
+    left, left_eq, left_enum, right, right_eq, right_enum = pair
+    none = "builtins:NoneType"
+
+    def never_equals_none(eq):
+        # built-in equality, and sqlglot's expression equality (same type and same hash)
+        return eq.startswith("builtins:") or eq == "sqlglot.expressions.core:Expression"
+
+    if left_eq == "builtins:object" and right_eq == "builtins:object":
+        return True  # neither side defines equality: it is identity
+    if left == "builtins:bool" and right == "builtins:bool":
+        return True  # True and False are single objects
+    if right == none:
+        return left == none or never_equals_none(left_eq)
+    if left == none:
+        return never_equals_none(right_eq)
+    if right_enum:
+        # two members of one Enum are equal only when identical; an object with
+        # plain identity equality equals nothing else
+        return left == right or left_eq == "builtins:object"
+    if left_enum:
+        return right_eq == "builtins:object"
+    return False
+
+
+def _harmless_rewrites(maps, file_patches, repo):
+    """Files of the patch in which all that happens is that `is` comparisons
+    become `==` (or `is not` becomes `!=`) at places where, for every pair of
+    operands any test puts there at the pinned commit, both give the same
+    result.  A test that reads none of the patch's other files then runs exactly
+    as before, step by step, so it cannot change its outcome.
+
+    Returns {path: (new source, places)}; empty unless every source file in
+    the patch qualifies and the rest are edits to existing fixture files."""
+    swaps = maps.swaps
+    if not swaps or not file_patches:
+        return {}
+    found = {}
+    try:
+        for fp in file_patches:
+            path = fp.new or fp.old
+            if fp.old != fp.new or fp.renamed or fp.binary or fp.created or fp.deleted or fp.mode_only:
+                return {}
+            if path.startswith("tests/fixtures/"):
+                continue
+            if not (path.startswith("sqlglot/") and path.endswith(".py")) or maps.opened.get(path, 0):
+                return {}
+            with open(os.path.join(repo, path), "rb") as handle:
+                old = handle.read()
+            new = patchlib.apply(old, fp)
+            places = []
+            for site in astdiff.diff(old, new, keep_swaps=True):
+                if site[0] != "swap":
+                    return {}
+                seen = swaps.get(path, {}).get("%d:%d" % (site[1], site[2]))
+                if not seen or not all(_same_result(pair) for pair in seen):
+                    return {}
+                places.append(site[1])
+            if places:
+                found[path] = (new, places)
+            elif new != old and astdiff.diff(old, new):
+                return {}
+    except Exception:
+        return {}
+    return found
 
 
 def _one_file(maps, plan, fp, repo):

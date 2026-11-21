@@ -12,6 +12,16 @@ Entry for the RWX Blast Radius track: given a patch against sqlglot at
    (`app/analyze.py`). A patch that leaves the program unchanged (comments, formatting, documentation
    strings: the doctest loader is not among the listed tests) has none. A changed class-level
    setting is narrowed to the tests that use the class and reach a statement reading that name.
+   One more kind of patch leaves every test's run unchanged: `x is y` rewritten as `x == y` (or
+   `is not` as `!=`) where the two cannot differ. Whether they can differ depends on what the
+   operands are, so `maps/swaps.json` records, for every `is` comparison in sqlglot's source, the
+   kinds of operands the suite puts there at the pinned commit (their types, which class defines
+   their `__eq__`, whether they are Enum members; built by `tools/swapmap.py`). The rewrite is
+   taken as harmless only when every recorded pair is one where identity and equality must agree:
+   anything against `None` whose equality is built-in or sqlglot's expression equality, two
+   members of one Enum, two booleans, or two objects with plain identity equality
+   (`analyze._same_result`). Anything else, or the same rewrite next to other code changes, is
+   treated like any other edit.
 2. **Run.** The cheap candidates are run against the patched tree inside the container
    (`app/runner.py`), in a forked child that already has the third-party modules loaded. Only tests
    that fail are selected; a test that hangs or kills its child counts as failing. When running
@@ -48,4 +58,6 @@ python tools/importpass.py                # in the sqlglot checkout, MAP_OUT=<di
 python tools/isomap.py <checkout> <tests.json> <iso dir>
 python tools/timepass.py <checkout> <tests.json> <times.json>
 python tools/packmaps.py <iso dir> <dir>/importpass.json <checkout> maps/map.bin <times.json>
+python tools/swapmap.py rewrite <copy of checkout>   # then run every test on the copy with BRPROF_OUT=<notes>
+python tools/swapmap.py pack <notes> maps/swaps.json
 ```

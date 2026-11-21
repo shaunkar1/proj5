@@ -459,7 +459,7 @@ def main(out):
                         where[key] = where.get(key, 0) + 1
                 log(commit, "evidence", json.dumps({"failed_in": where, "mode": "run" if getattr(plan, "ran_light", False) else "blind",
                     "probe": {id_of[n].rsplit("::", 1)[-1]: ("fail" if job is not None and n in job.failed else "pass") for n in getattr(plan, "probe", {})}}))
-                log(commit, "cands=%d ran=%d failed=%d selected=%d cpu=%.2f rec=%.2f" % (len(plan.numbers), len(plan.light), len(light_failed), len(selected), job.cpu if job else 0, sum(seconds[n] for n in plan.light)), "|", "; ".join(plan.notes))
+                log(commit, "cands=%d ran=%d failed=%d selected=%d cpu=%.2f rec=%.2f est=%.2f" % (len(plan.numbers), len(plan.light), len(light_failed), len(selected), job.cpu if job else 0, sum(seconds[n] for n in plan.light), job.estimate if job else 0), "|", "; ".join(plan.notes))
                 if job and os.environ.get("BR_TRACE"):
                     top = sorted(job.elapsed.items(), key=lambda kv: -kv[1])[:6]
                     log(commit, "trace: in tests %.2f s of %.2f s cpu;" % (sum(job.elapsed.values()), job.cpu), ", ".join("%s %.2f" % (id_of.get(n, str(n)).split("::")[-1], e) for n, e in top))

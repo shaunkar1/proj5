@@ -389,9 +389,11 @@ def _rss_mb(pid):
         return 0
 
 
-def run_jobs(jobs, parallel=2, stop_at=None, rss_limit_mb=1400, log=None):
+def run_jobs(jobs, parallel=2, stop_at=None, rss_limit_mb=1400, log=None, hurry_at=None):
     """Run jobs, `parallel` at a time.  Jobs not finished by `stop_at`
-    (time.monotonic()) keep whatever is still pending in job.pending."""
+    (time.monotonic()) keep whatever is still pending in job.pending.
+    With `hurry_at`, jobs run one at a time until then: two busy processes
+    on sibling hardware threads each burn more CPU seconds than one alone."""
     queue = list(jobs)
     active = {}
     while queue or active:
@@ -401,7 +403,8 @@ def run_jobs(jobs, parallel=2, stop_at=None, rss_limit_mb=1400, log=None):
                 job.kill()
                 job.reap()
             return False
-        while queue and len(active) < parallel:
+        lanes = 1 if hurry_at is not None and now < hurry_at else parallel
+        while queue and len(active) < lanes:
             job = queue.pop(0)
             if not job.pending:
                 continue

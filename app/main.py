@@ -23,6 +23,7 @@ REPO = os.environ.get("BR_REPO", "/app/repo")
 MAPS = os.environ.get("BR_MAPS", os.path.join(HERE, "..", "maps", "map.bin"))
 TMP = os.environ.get("BR_TMP", "/tmp")
 VERBOSE = os.environ.get("BR_VERBOSE") == "1"
+PARALLEL = int(os.environ.get("BR_PARALLEL") or 2)
 
 WORKER_MS = 2000
 MAX_WORKERS = 8
@@ -127,7 +128,10 @@ def main(out):
         unknown = [n for test_id, n in number_of.items() if test_id not in set(maps.ids)]
         # the batch has 3 minutes of wall clock (4.5 in the final, which is about
         # one and a half times as large); stop running tests well before that
-        stop_at = START + float(os.environ.get("BR_CUTOFF") or 0.62 * (180.0 if len(commits) <= 48 else 270.0))
+        limit = 180.0 if len(commits) <= 48 else 270.0
+        stop_at = START + float(os.environ.get("BR_CUTOFF") or 0.62 * limit)
+        # one lane while there is time to spare, two once a third of the limit is gone
+        hurry_at = START + float(os.environ.get("BR_HURRY") or 0.3 * limit)
 
         plans = {}
         query_budget = {}
@@ -366,7 +370,7 @@ def main(out):
                     pass
             # longest first, so the two lanes stay balanced
             jobs.sort(key=lambda j: -j.estimate)
-            runner.run_jobs(jobs, parallel=2, stop_at=stop_at, log=log)
+            runner.run_jobs(jobs, parallel=PARALLEL, stop_at=stop_at, log=log, hurry_at=hurry_at)
             for job in jobs:
                 overlay.remove(job.root)
 

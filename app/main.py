@@ -123,7 +123,7 @@ def main(out):
         unknown = [n for test_id, n in number_of.items() if test_id not in set(maps.ids)]
         # the batch has 3 minutes of wall clock (4.5 in the final, which is about
         # one and a half times as large); stop running tests well before that
-        stop_at = START + 0.62 * (180.0 if len(commits) <= 48 else 270.0)
+        stop_at = START + float(os.environ.get("BR_CUTOFF") or 0.62 * (180.0 if len(commits) <= 48 else 270.0))
 
         plans = {}
         query_budget = {}
@@ -271,9 +271,16 @@ def main(out):
             plan.ran_light = True
             if light and run_cost > blind_cost:
                 log(commit, "cheaper to select %d candidates unseen (%.1f s) than to run them (%.1f s)" % (len(light) + len(unprobed), blind_cost, run_cost))
-                plan.blind_numbers.update(light)
+                # A probe alone is not trusted: the cheap executor tests that reach
+                # the change still run, as witnesses.  With none of those, a probed
+                # test is selected unseen like the rest.
+                witnesses = [n for n in light if id_of[n].startswith(tpc.EXECUTOR)] if plan.probe else []
+                if plan.probe and not witnesses:
+                    unprobed = unprobed | set(plan.probe)
+                    plan.probe = {}
+                plan.blind_numbers.update(n for n in light if n not in witnesses)
                 plan.blind_numbers.update(unprobed)
-                plan.light = light = []
+                plan.light = light = witnesses
                 plan.heavy = set(plan.proxy) | settled | set(plan.probe)
                 plan.ran_light = False
             # queries to run: all that can see the patch when that settles the
@@ -370,8 +377,10 @@ def main(out):
                 or len(plan.light) < MIN_EVIDENCE
                 or any(p.startswith(EXECUTOR_PATHS) for p in plan.touched)
             )
+            executor_failed = any(id_of[n].startswith(tpc.EXECUTOR) for n in light_failed if n >= 0)
             strong = (
                 len(light_failed) >= STRONG_EVIDENCE
+                or executor_failed
                 or unfinished
                 or any(p.startswith(EXECUTOR_PATHS) for p in plan.touched)
             )

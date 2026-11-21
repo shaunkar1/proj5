@@ -279,6 +279,7 @@ def main(out):
             # queries to run: all that can see the patch when that settles the
             # test, otherwise the cheapest few as a safety net for the rule below
             plan.exact = {}
+            plan.probe_cpu = {}
             query_entries = []
             for n, (method, positions, total) in sorted(plan.query.items()):
                 if n in plan.blind_numbers:
@@ -289,6 +290,7 @@ def main(out):
                 elif n in plan.probe:
                     chosen = plan.probe[n]
                     plan.exact[n] = False
+                    plan.probe_cpu[n] = maps.queries[method][2] + sum(query_cpu_of(maps, method, k) for k in chosen)
                 else:
                     continue
                 query_entries.append((n, runner.PROXY + "query:%s|%s" % (method, ",".join(map(str, sorted(chosen))))))
@@ -380,8 +382,10 @@ def main(out):
                 if exact:
                     continue  # ran in full and passed (a failure is already selected)
                 if exact is False:
-                    # probed and clean: left out unless many cheaper tests fail
-                    if strong:
+                    # probed and clean: left out unless many cheaper tests fail,
+                    # or the probe itself ran far slower than it should
+                    slow = job is not None and job.elapsed.get(n, 0.0) > 2.0 * plan.probe_cpu.get(n, 0.0) + 2.0
+                    if strong or slow:
                         selected.add(n)
                 elif evidence:
                     selected.add(n)

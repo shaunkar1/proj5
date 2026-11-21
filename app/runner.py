@@ -272,6 +272,8 @@ class Job:
         self.cpu = 0.0
         self.times = {}
         self.kills = 0
+        self.elapsed = {}  # index -> wall seconds the test took
+        self.started_at = 0.0
 
     def start(self):
         rfd, wfd = os.pipe()
@@ -305,8 +307,10 @@ class Job:
             kind, _, rest = line.decode("utf-8", "replace").partition(" ")
             if kind == "S":
                 self.current = int(rest)
-                self.deadline = time.monotonic() + self.budgets.get(self.current, 20.0)
+                self.started_at = time.monotonic()
+                self.deadline = self.started_at + self.budgets.get(self.current, 20.0)
             elif kind in ("P", "F"):
+                self.elapsed[int(rest)] = time.monotonic() - self.started_at
                 self._done(int(rest), kind == "F")
                 self.current = None
                 self.deadline = time.monotonic() + 20.0

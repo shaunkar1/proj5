@@ -7,13 +7,22 @@ OUT = os.environ["MAP_OUT"]
 sys.path.insert(0, ROOT)
 cov = coverage.Coverage(data_file=None, source=[os.path.join(ROOT, "sqlglot")], config_file=False)
 started = set()
+instantiated = set()
 mon = sys.monitoring
 mon.use_tool_id(4, "started")
 def on_start(code, offset):
     f = code.co_filename
     if f.startswith(ROOT + os.sep) and code.co_name != "<module>":
         started.add((os.path.relpath(f, ROOT), code.co_firstlineno, code.co_name))
-    return mon.DISABLE
+    if code.co_name != "__init__" or not code.co_varnames:
+        return mon.DISABLE
+    try:
+        t = type(sys._getframe(1).f_locals.get(code.co_varnames[0]))
+        for k in t.__mro__:
+            if k.__module__.startswith("sqlglot"):
+                instantiated.add(k.__module__ + ":" + k.__qualname__)
+    except Exception:
+        pass
 mon.register_callback(4, mon.events.PY_START, on_start)
 mon.set_events(4, mon.events.PY_START)
 cov.start()
@@ -23,9 +32,6 @@ for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
     if info.name.endswith("__main__"):
         continue
     importlib.import_module(info.name)
-from sqlglot.dialects.dialect import Dialect, Dialects
-for d in Dialects:
-    Dialect.get_or_raise(d.value) if d.value else None
 cov.stop()
 mon.set_events(4, 0)
 data = cov.get_data()
@@ -44,5 +50,5 @@ for name, mod in list(sys.modules.items()):
         seen.add(c)
         classes[c.__module__ + ":" + c.__qualname__] = [b.__module__ + ":" + b.__qualname__ for b in c.__mro__[1:] if b.__module__.startswith("sqlglot")]
         stack.extend(v for v in vars(c).values() if isinstance(v, type) and v.__module__ == name)
-json.dump({"started": sorted(started), "import_lines": lines, "base_modules": base, "classes": classes}, open(os.path.join(OUT, "importpass.json"), "w"))
+json.dump({"instantiated": sorted(instantiated), "started": sorted(started), "import_lines": lines, "base_modules": base, "classes": classes}, open(os.path.join(OUT, "importpass.json"), "w"))
 print(len(lines), "files", sum(map(len, lines.values())), "import-time lines", len(base), "base modules", len(classes), "classes")

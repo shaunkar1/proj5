@@ -61,72 +61,110 @@ for path in sorted(glob.glob(os.path.join(ROOT, "tests", "**", "test_*.py"), rec
             mods.add(node.module)
     preload[rel] = sorted(m for m in mods if not m.startswith(("sqlglot", "tests")))
 
-# Where class-level names are read.  For every name assigned in a class body
-# somewhere in sqlglot: the functions that mention it.  A name that is also
-# used while modules are being imported (outside functions, or inside functions
-# that run at import time) cannot be followed, and is stored as None.
+# Where class-level and module-level names are read.  For every name assigned in
+# a class body or at module level somewhere in sqlglot: the functions that
+# mention it, and the names whose values are derived from it (assigned from it in
+# a class body, or stored as attributes by a function that reads it, such as a
+# metaclass).  A name that is used bare at module level cannot be followed and
+# is stored as None.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
 import astdiff
 
-class_names = set()
+class_names, module_names = set(), set()
 trees = {}
 for path in sorted(glob.glob(os.path.join(ROOT, "sqlglot", "**", "*.py"), recursive=True) + glob.glob(os.path.join(ROOT, "tests", "**", "*.py"), recursive=True)):
     rel = os.path.relpath(path, ROOT)
     trees[rel] = ast.parse(open(path).read())
     if rel.startswith("sqlglot/"):
+        for st in trees[rel].body:
+            module_names.update(astdiff.assigned_names(st) or ())
         for node in ast.walk(trees[rel]):
             if isinstance(node, ast.ClassDef):
                 for st in node.body:
                     class_names.update(astdiff.assigned_names(st) or ())
+names = class_names | module_names
 import_started = {(f, l) for f, l, _name in ip["started"]}
-readers = {name: set() for name in class_names}
-edges = {name: set() for name in class_names}
+readers = {name: set() for name in names}   # name -> {(file, function first line, lo, hi)}
+edges = {name: set() for name in names}
 blocked = set()
+statements = {}  # (function, statement id) -> [names read, names stored]
+stores_in = {}   # function -> names it stores as attributes
 
-def visit(rel, node, func, class_targets, in_class_body):
+def visit(rel, node, func, targets, block):
     for field, value in ast.iter_fields(node):
         children = value if isinstance(value, list) else [value]
         for child in children:
             if not isinstance(child, ast.AST):
                 continue
-            c_func, c_targets, c_body = func, class_targets, False
+            c_func, c_targets, c_block = func, targets, block
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and field == "body":
-                c_func, c_targets = astdiff._first_line(node), None
-            elif isinstance(node, ast.ClassDef) and field == "body":
-                c_func, c_targets, c_body = (func, astdiff.assigned_names(child) or (), True) if func is None else (func, None, False)
-            elif func is None and in_class_body is False and isinstance(node, ast.Module):
-                c_targets = None
+                c_func, c_targets = (rel, astdiff._first_line(node)), None
+                c_block = child if isinstance(child, astdiff._BLOCKS) else node.body
+            elif func is None and isinstance(node, (ast.ClassDef, ast.Module)) and field == "body":
+                c_targets = astdiff.assigned_names(child) or ()
+            elif func is not None and isinstance(child, astdiff._BLOCKS):
+                c_block = child
             name = None
+            store = False
             if isinstance(child, ast.Attribute):
                 name = child.attr
+                store = isinstance(child.ctx, ast.Store)
             elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
                 name = child.id
             elif isinstance(child, ast.Constant) and isinstance(child.value, str):
                 name = child.value
             if name in readers:
                 if c_func is not None:
-                    readers[name].add((rel, c_func))
+                    entry = statements.setdefault((c_func, id(c_block)), [set(), set()])
+                    if store:
+                        stores_in.setdefault(c_func, set()).add(name)
+                        entry[1].add(name)
+                    else:
+                        if isinstance(c_block, astdiff._BLOCKS):
+                            lo, hi = astdiff._header_span(c_block)
+                        else:
+                            lo, hi = c_block.lineno, c_block.end_lineno
+                        readers[name].add((rel, c_func[1], lo, hi))
+                        entry[0].add(name)
                 elif c_targets:
                     edges[name].update(c_targets)
-                else:
+                elif not (isinstance(child, ast.Constant)):
                     blocked.add(name)
-            visit(rel, child, c_func, c_targets, c_body)
+            visit(rel, child, c_func, c_targets, c_block)
 
 for rel, tree in trees.items():
-    visit(rel, tree, None, None, False)
+    visit(rel, tree, None, None, None)
+# a value read in a statement that stores attributes flows into those attributes;
+# read anywhere else in such a function, it may flow into any attribute the function stores
+for (func, _), (read, stored) in statements.items():
+    for name in read:
+        edges[name].update(stored if stored else stores_in.get(func, ()))
 refs = {}
-for name in class_names:
-    if name in blocked or len(readers[name]) > 300 or any(r in import_started for r in readers[name]):
+for name in names:
+    if name in blocked or len(readers[name]) > 400:
         refs[name] = None
     else:
-        refs[name] = (sorted(readers[name]), sorted(edges[name] - {name}))
-print("class-level names", len(class_names), "followable", sum(v is not None for v in refs.values()))
+        refs[name] = (sorted(readers[name]), sorted(edges[name] - {name}), any((r[0], r[1]) in import_started for r in readers[name]))
+print("names", len(names), "followable", sum(v is not None for v in refs.values()), "of which read at import", sum(bool(v and v[2]) for v in refs.values()))
 
 timing = json.load(open(sys.argv[5])) if len(sys.argv) > 5 else {"tests": {}, "classes": {}}
 times = timing["tests"]
 
+queries = {}
+if len(sys.argv) > 6:
+    for method, sub in json.load(open(sys.argv[6])).items():
+        sub_files = {}
+        for f in set(sub["lines"]) | set(sub["started"]):
+            sub_files[f] = (pack({int(l): int(m, 16) for l, m in sub["lines"].get(f, {}).items()}),
+                            pack({int(l): int(m, 16) for l, m in sub["started"].get(f, {}).items()}))
+        queries[method] = {"n": sub["n"], "cpu": sub["cpu"], "base_cpu": sub["base_cpu"], "files": sub_files,
+                           "inst": {c: int(m, 16) for c, m in sub["inst"].items()}}
+        print("queries", method, sub["n"], "cpu", round(sum(sub["cpu"]), 1))
+
 index = {
+    "queries": queries,
     "refs": refs,
+    "instantiated_at_import": ip["instantiated"],
     "times": [times.get(ids[i]) for i in range(n)],
     "class_setup": timing["classes"],
     "ids": ids,

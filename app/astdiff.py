@@ -12,7 +12,10 @@ Each difference is reported as a "site":
                             code that runs at import time inside a class body;
                             targets are the names it assigns, when it is a plain
                             assignment, else None
-  ("module", lo, hi)        code that runs at import time at module level
+  ("module", lo, hi, targets)
+                            code that runs at import time at module level
+  ("enter", first)          a default value or annotation of a function defined at
+                            class or module level: seen by calls of that function
 
 An empty list means the two files compile to the same program.
 """
@@ -76,6 +79,14 @@ def _site(path, structural):
             return ("func", flo, fhi, first)
         lo, hi = _header_span(inner)
         return ("lines", lo, hi, first)
+    signature_of = None
+    for node, field in path:
+        if isinstance(node, _FUNCS) and field in ("args", "returns"):
+            signature_of = node
+        elif isinstance(node, (ast.ClassDef,) + _FUNCS):
+            signature_of = None
+    if signature_of is not None:
+        return ("enter", _first_line(signature_of))
     cls = None
     names = []
     statement = None
@@ -89,7 +100,7 @@ def _site(path, structural):
         return ("class", ".".join(names), lo, hi, assigned_names(statement))
     top = path[1][0] if len(path) > 1 else path[0][0]
     lo, hi = _span(top) if hasattr(top, "lineno") else (1, 1)
-    return ("module", lo, hi)
+    return ("module", lo, hi, assigned_names(top))
 
 
 def assigned_names(statement):

@@ -185,6 +185,29 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False):
         suite.run(result)
     except BaseException:
         pass
+    query_runs = [(index, test_id[len("query:"):]) for index, test_id in stand_ins if test_id.startswith("query:")]
+    stand_ins = [(index, test_id) for index, test_id in stand_ins if not test_id.startswith("query:")]
+    if query_runs:
+        # the long TPC tests, thinned to the queries the patch can reach
+        try:
+            import tpc
+
+            module = importlib.import_module(tpc.MODULE)
+            selection = {}
+            cases = unittest.TestSuite()
+            case_index = {}
+            for index, spec in query_runs:
+                method, _, positions = spec.partition(":")
+                selection[method] = {int(p) for p in positions.split(",") if p}
+            tpc.thin(module, selection)
+            for index, spec in query_runs:
+                case = getattr(module, tpc.CLASS)(spec.partition(":")[0])
+                case_index[case.id()] = index
+                cases.addTest(case)
+            cases.run(_Result(emit, case_index))
+        except BaseException:
+            for index, _spec in query_runs:
+                emit("F %d\n" % index)
     if stand_ins:
         import proxies
 
@@ -222,6 +245,7 @@ class Job:
         self.restarts = 0
         self.cpu = 0.0
         self.times = {}
+        self.kills = 0
 
     def start(self):
         rfd, wfd = os.pipe()
@@ -383,6 +407,12 @@ def run_jobs(jobs, parallel=2, stop_at=None, rss_limit_mb=1400, log=None):
                 job.kill()
                 del active[fd]
                 job.interrupted()
+                job.kills += 1
+                if job.kills >= 2:
+                    # the patch hangs or balloons whatever reaches it: stop paying for
+                    # proof and treat everything left as failing
+                    for index, _ in list(job.pending):
+                        job._done(index, True)
                 if job.pending:
                     queue.insert(0, job)
     return True

@@ -37,6 +37,8 @@ EXECUTOR_HEAVY = (
 )
 EXECUTOR_PATHS = ("tests/test_executor.py", "tests/fixtures/optimizer/tpc-")
 MIN_EVIDENCE = 3
+EXACT_BUDGET = 10.0        # CPU seconds worth spending to settle a long TPC test outright
+PROBE_BUDGET = 0.0         # no partial looks: a partial pass proves nothing
 FAIL_ODDS = 0.5            # chance that a reachable change breaks at least one test
 FAIL_SHARE = 0.3           # share of the candidates' worker time the failing ones need
 
@@ -72,6 +74,10 @@ def pack_cost(numbers, millis):
     return max(sum(millis[n] for n in w) for w in workers) + WORKER_MS * len(workers)
 
 
+def query_cpu_of(maps, method, position):
+    return maps.queries[method][1][position]
+
+
 def bits(mask):
     out = []
     i = 0
@@ -88,6 +94,7 @@ def main(out):
     import overlay
     import proxies
     import runner
+    import tpc
 
     with open(os.path.join(DATA, "tests.json")) as handle:
         tests = json.load(handle)["tests"]
@@ -116,6 +123,7 @@ def main(out):
         stop_at = START + 0.62 * SECONDS_PER_COMMIT * max(len(commits), 1)
 
         plans = {}
+        query_budget = {}
         jobs = []
         job_of = {}
         preload = set()
@@ -156,19 +164,65 @@ def main(out):
             # them unseen costs worker time.  Take the cheaper road.
             # Running leaves nothing to select about half the time, and usually a
             # small part of the candidates otherwise.
-            blind_cost = pack_cost(cands, millis) / 1000.0
+            executor_heavy = {n for n in heavy if n not in plan.proxy}
+            # The long TPC tests: which of their queries can see the patch, and
+            # can those be run outright for a firm answer?
+            plan.query = {}
+            stable = not any(p.startswith(tpc.UNSTABLE) for p in plan.touched)
+            for n in sorted(executor_heavy):
+                method = tpc.IDS[id_of[n]]
+                entry = maps.queries.get(method)
+                if entry is None or not stable or n in plan.blind_numbers:
+                    continue
+                view, query_cpu, base_cpu = entry
+                mask = analyze.query_mask(maps, plan, method)
+                positions = bits(mask) if mask is not None else list(range(view.size))
+                positions.sort(key=lambda k: query_cpu[k])
+                total = base_cpu + sum(query_cpu[k] for k in positions)
+                plan.query[n] = (method, positions, total)
+            settled, spent_exact = set(), 0.0
+            for n in sorted(plan.query, key=lambda n: plan.query[n][2]):
+                if spent_exact + plan.query[n][2] <= EXACT_BUDGET:
+                    settled.add(n)
+                    spent_exact += plan.query[n][2]
+            unsettled = executor_heavy - settled
+            blind_cost = pack_cost(set(light) | unsettled | plan.blind_numbers, millis) / 1000.0
             cpu_cost = 0.08 + sum(estimate[n] for n in light)
             cpu_cost += sum(maps.class_setup.get(c, 0.05) for c in {id_of[n].rsplit("::", 1)[0] for n in light})
             run_cost = cpu_cost + FAIL_ODDS * (2.0 + FAIL_SHARE * max(blind_cost - 2.0, 0.0))
+            plan.ran_light = True
             if light and run_cost > blind_cost:
-                log(commit, "cheaper to select all %d candidates (%.1f s) than to run them (%.1f s)" % (len(cands), blind_cost, run_cost))
-                plan.blind_numbers.update(cands)
+                log(commit, "cheaper to select %d candidates unseen (%.1f s) than to run them (%.1f s)" % (len(light) + len(unsettled), blind_cost, run_cost))
+                plan.blind_numbers.update(light)
+                plan.blind_numbers.update(unsettled)
                 plan.light = light = []
-                plan.proxy = {}
-                plan.heavy = set()
-                continue
+                plan.heavy = set(plan.proxy) | settled
+                plan.ran_light = False
+            # queries to run: all that can see the patch when that settles the
+            # test, otherwise the cheapest few as a safety net for the rule below
+            plan.exact = {}
+            query_entries = []
+            for n, (method, positions, total) in sorted(plan.query.items()):
+                if n in plan.blind_numbers:
+                    continue
+                if n in settled:
+                    chosen = positions
+                    plan.exact[n] = True
+                else:
+                    chosen, spent = [], 0.0
+                    for k in positions:
+                        if spent + query_cpu_of(maps, method, k) > PROBE_BUDGET:
+                            break
+                        chosen.append(k)
+                        spent += query_cpu_of(maps, method, k)
+                    plan.exact[n] = False
+                    if not chosen:
+                        continue
+                query_entries.append((n, runner.PROXY + "query:%s:%s" % (method, ",".join(map(str, sorted(chosen))))))
+                query_budget[n] = 30.0 + 6.0 * total
             entries = [(n, id_of[n]) for n in light]
             entries += [(n, runner.PROXY + test_id) for n, test_id in sorted(plan.proxy.items())]
+            entries += query_entries
             for k, module in enumerate(sorted(plan.imports)):
                 plan.smoke[-1 - k] = module
                 entries.append((-1 - k, runner.PROXY + "import:" + module))
@@ -178,9 +232,11 @@ def main(out):
             copies = ["tests/test_sqlglotc.py"] if any(p.startswith("sqlglotc/") for p in plan.touched) else []
             overlay.remove(root)
             overlay.build(REPO, root, plan.files, copies)
-            budgets = {n: max(8.0, 8.0 * seconds[n]) for n in light}
+            budgets = {n: max(4.0, 6.0 * max(estimate[n], seconds[n]) + 2.0) for n in light}
             for n in plan.proxy:
                 budgets[n] = 25.0
+            for n, _entry in query_entries:
+                budgets[n] = query_budget[n]
             short = not ({"tests/test_executor.py", "tests/helpers.py"} & plan.touched)
             job = runner.Job(commit, root, entries, budgets, short_tables=short)
             job.estimate = cpu_cost
@@ -215,7 +271,7 @@ def main(out):
             unfinished = False
             if job is not None:
                 unfinished = bool(job.pending)
-                light_failed = {n for n in job.failed if n >= 0 and n not in plan.proxy}
+                light_failed = {n for n in job.failed if n >= 0 and n not in plan.proxy and n not in plan.query}
                 selected |= {n for n in job.failed if n >= 0}        # failed tests and stand-ins
                 selected |= {n for n, _ in job.pending if n >= 0}    # never got to run
                 for k, module in plan.smoke.items():
@@ -224,9 +280,11 @@ def main(out):
                         mask = plan.loaders.get(module, maps.all)
                         selected |= {number_of[maps.ids[i]] for i in bits(mask) if maps.ids[i] in number_of}
                         light_failed.add(k)
-            # The long TPC executor tests are never run here.  They are selected
-            # when a cheaper test reaching the same change fails, when too few
-            # cheaper tests reach it to say anything, or when their own inputs changed.
+            # The long TPC tests.  When every query that can see the patch was
+            # run, that run is the answer.  Otherwise they are selected when a
+            # run query fails, when a cheaper test reaching the same change
+            # fails, when too few cheaper tests reach it to say anything, or
+            # when their own inputs changed.
             evidence = (
                 bool(light_failed)
                 or unfinished
@@ -234,8 +292,10 @@ def main(out):
                 or any(p.startswith(EXECUTOR_PATHS) for p in plan.touched)
             )
             for n in plan.heavy:
-                if n in plan.proxy:
+                if n in plan.proxy or n in selected:
                     continue
+                if getattr(plan, "exact", {}).get(n):
+                    continue  # ran in full and passed (a failure is already selected)
                 if evidence:
                     selected.add(n)
             if VERBOSE:

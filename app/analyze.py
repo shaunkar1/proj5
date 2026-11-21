@@ -6,6 +6,10 @@ opens and the sqlglot classes it instantiates.  A patch is located in the old
 source (astdiff) and matched against those maps.  Nothing here knows about any
 particular patch: the answer is always "tests whose own execution reaches the
 changed code", and whether they really fail is settled by running them.
+
+The same matching is done one level down for the long TPC tests: the map also
+holds, for each of their queries, what that query alone reaches, so that only
+the queries a patch can affect need to be run.
 """
 
 import os
@@ -29,44 +33,26 @@ INSTANCE_ROOTS = (
 CONFIG_FILES = ("pytest.ini", "tox.ini", "conftest.py", "pyproject.toml", "setup.cfg", "sitecustomize.py")
 
 
-class Maps:
-    def __init__(self, path):
-        with open(path, "rb") as handle:
-            data = pickle.loads(zlib.decompress(handle.read()))
-        self.ids = data["ids"]
-        self.cpu = data["cpu"]
-        self.opened = data["opened"]
-        self.inst = data["inst"]
-        self.anyline = data["anyline"]
-        self.base_modules = set(data["base_modules"])
-        self.classes = data["classes"]
-        self.preload = data["preload"]
-        self.refs = data.get("refs", {})
-        self.times = data.get("times") or [None] * len(data["ids"])
-        self.class_setup = data.get("class_setup", {})
-        self._files = data["files"]
+class View:
+    """What each member of a population (tests, or queries of one test) reaches."""
+
+    def __init__(self, size, files, inst, refs):
+        self.size = size
+        self.all = (1 << size) - 1
+        self._files = files      # path -> packed ((sets, lines), (sets, firsts)) or its zlib pickle
         self._cache = {}
-        self.all = (1 << len(self.ids)) - 1
-        self.by_file = {}
-        for i, test_id in enumerate(self.ids):
-            f = test_id.split("::", 1)[0]
-            self.by_file[f] = self.by_file.get(f, 0) | (1 << i)
-        self.by_class = {}
-        for i, test_id in enumerate(self.ids):
-            c = test_id.rsplit("::", 1)[0]
-            self.by_class[c] = self.by_class.get(c, 0) | (1 << i)
-        self.lazy_load = 0
-        for i, test_id in enumerate(self.ids):
-            if test_id.endswith("::test_lazy_load"):
-                self.lazy_load |= 1 << i
+        self.inst = inst         # class -> mask
+        self.refs = refs         # name -> (reader statements, derived names, read at import) or None
 
     def file(self, path):
         if path not in self._cache:
             blob = self._files.get(path)
             if blob is None:
                 self._cache[path] = (([], {}), ([], {}))
-            else:
+            elif isinstance(blob, bytes):
                 self._cache[path] = pickle.loads(zlib.decompress(blob))
+            else:
+                self._cache[path] = blob
         return self._cache[path]
 
     def covering(self, path, lo, hi):
@@ -80,8 +66,15 @@ class Maps:
                 mask |= sets[k]
         return mask
 
+    def loading(self, path):
+        (sets, _lines), _ = self.file(path)
+        mask = 0
+        for m in sets:
+            mask |= m
+        return mask
+
     def entering(self, path, first):
-        """Tests that enter the function whose code starts at `first`, or None if unknown."""
+        """Members that enter the function whose code starts at `first`, or None if unknown."""
         _, (sets, firsts) = self.file(path)
         k = firsts.get(first)
         return None if k is None else sets[k]
@@ -95,9 +88,11 @@ class Maps:
                 mask |= sets[k]
         return mask
 
-    def readers(self, names):
-        """Tests entering a function that reads one of these class-level names
-        (following names derived from them), or None when that cannot be told."""
+    def readers(self, names, allow_import_time):
+        """Members executing a statement that reads one of these names, following
+        names derived from them; None when that cannot be told.  With
+        allow_import_time False, a name read by a function that also runs while
+        modules are imported counts as untraceable."""
         todo = list(names)
         seen = set()
         mask = 0
@@ -109,12 +104,62 @@ class Maps:
             entry = self.refs.get(name)
             if entry is None:
                 return None
-            functions, derived = entry
-            for path, first in functions:
+            statements, derived, at_import = entry
+            if at_import and not allow_import_time:
+                return None
+            for path, first, lo, hi in statements:
+                reached = self.covering(path, lo, hi)
                 entered = self.entering(path, first)
-                if entered:
-                    mask |= entered
+                if entered is not None:
+                    reached &= entered
+                mask |= reached
             todo.extend(derived)
+            if len(seen) > 40:
+                return None
+        return mask
+
+
+class Maps:
+    def __init__(self, path):
+        with open(path, "rb") as handle:
+            data = pickle.loads(zlib.decompress(handle.read()))
+        self.ids = data["ids"]
+        self.times = data.get("times") or [None] * len(self.ids)
+        self.class_setup = data.get("class_setup", {})
+        self.opened = data["opened"]
+        self.anyline = data["anyline"]
+        self.base_modules = set(data["base_modules"])
+        self.classes = data["classes"]
+        self.preload = data["preload"]
+        self.at_import = set(data.get("instantiated_at_import", ()))
+        refs = data.get("refs", {})
+        self.view = View(len(self.ids), data["files"], data["inst"], refs)
+        self.all = self.view.all
+        # per-query views of the long TPC tests: method -> (View, cpu seconds per query, fixed cpu)
+        self.queries = {}
+        for method, sub in data.get("queries", {}).items():
+            self.queries[method] = (View(sub["n"], sub["files"], sub["inst"], refs), sub["cpu"], sub["base_cpu"])
+        self.by_file = {}
+        self.by_class = {}
+        self.lazy_load = 0
+        for i, test_id in enumerate(self.ids):
+            f = test_id.split("::", 1)[0]
+            self.by_file[f] = self.by_file.get(f, 0) | (1 << i)
+            c = test_id.rsplit("::", 1)[0]
+            self.by_class[c] = self.by_class.get(c, 0) | (1 << i)
+            if test_id.endswith("::test_lazy_load"):
+                self.lazy_load |= 1 << i
+
+    def package_users(self, directory):
+        """Tests that load any module of a package, or live in it."""
+        prefix = directory.rstrip("/") + "/"
+        mask = 0
+        for path, m in self.anyline.items():
+            if path.startswith(prefix):
+                mask |= m
+        for path, m in self.by_file.items():
+            if path.startswith(prefix):
+                mask |= m
         return mask
 
     def dir_openers(self, directory):
@@ -134,9 +179,10 @@ class Plan:
         self.files = {}         # path -> new bytes, or None when deleted
         self.notes = []
         self.touched = set()
-        self.runtime_only = True  # every change is inside function bodies
-        self.imports = set()      # modules whose import-time code changed
-        self.loaders = {}         # module -> tests that load it
+        self.imports = set()    # modules whose import-time code changed
+        self.loaders = {}       # module -> tests that load it
+        self.python = []        # (path, sites, function spans) of changed python files
+        self.plain = True       # every candidate comes from located python changes
 
 
 def module_name(path):
@@ -153,75 +199,111 @@ def _is_instance_class(maps, key):
     return key in INSTANCE_ROOTS or any(b in INSTANCE_ROOTS for b in bases)
 
 
+def site_mask(maps, view, path, site, function_spans, loaders, notes=None):
+    """Members of `view` that can see the change at one site of a sqlglot or test
+    source file.  `loaders` are the members that load the file at all."""
+    is_test = path.startswith("tests/")
+    kind = site[0]
+    if kind == "enter":
+        mask = view.entering(path, site[1]) or 0
+        what = "signature of function at %d" % site[1]
+    elif kind in ("lines", "func"):
+        _, lo, hi, first = site
+        mask = view.covering(path, lo, hi)
+        entered = view.entering(path, first)
+        if entered is not None:
+            mask &= entered
+        what = "%d-%d in function at %d" % (lo, hi, first)
+    elif kind == "class":
+        _, name, lo, hi, targets = site
+        key = module_name(path) + ":" + name
+        methods = view.entering_any(path, [first for first, _last, _name in function_spans if lo <= first <= hi])
+        if is_test:
+            if view is maps.view:
+                mask = view.inst.get(key, 0) | methods | maps.by_class.get(path + "::" + name.split(".")[0], 0)
+            else:
+                mask = loaders
+        elif _is_instance_class(maps, key):
+            mask = view.inst.get(key, 0) | methods
+            # Instances made while modules are imported could carry the old
+            # value into import-time state; then nothing can be narrowed.
+            reading = view.readers(targets, True) if targets and key not in maps.at_import else None
+            if reading is not None:
+                mask &= reading
+        else:
+            mask = loaders
+        what = "class %s body" % name
+    else:
+        _, lo, hi, targets = site
+        mask = loaders
+        reading = view.readers(targets, False) if targets and not is_test else None
+        if reading is not None:
+            mask &= reading
+        what = "module level"
+    if notes is not None:
+        notes.append("%s: %s: %d tests" % (path, what, bin(mask).count("1")))
+    return mask
+
+
 def _python_file(maps, plan, path, old, new):
     is_test = path.startswith("tests/")
+    in_base = (not is_test) and module_name(path) in maps.base_modules
     loaders = maps.anyline.get(path, 0) | maps.opened.get(path, 0)
     if is_test:
         loaders |= maps.by_file.get(path, 0)
+    if os.path.basename(path) == "__init__.py":
+        loaders |= maps.package_users(os.path.dirname(path))
     if not is_test:
-        plan.loaders[module_name(path)] = loaders | (maps.lazy_load if module_name(path) in maps.base_modules else 0)
+        plan.loaders[module_name(path)] = loaders | (maps.lazy_load if in_base else 0)
     try:
         sites = astdiff.diff(old, new)
     except SyntaxError:
         plan.notes.append("%s: does not parse" % path)
-        plan.runtime_only = False
-        plan.cands |= loaders | (maps.lazy_load if module_name(path) in maps.base_modules else 0)
+        plan.plain = False
+        plan.cands |= loaders | (maps.lazy_load if in_base else 0)
         return
     except Exception:
         plan.notes.append("%s: could not compare" % path)
-        plan.runtime_only = False
+        plan.plain = False
         plan.cands |= loaders | maps.lazy_load
         return
+    if maps.opened.get(path, 0):
+        plan.cands |= maps.opened[path]
+        plan.plain = False
     if not sites:
         plan.notes.append("%s: same program" % path)
-        plan.cands |= maps.opened.get(path, 0)
         return
-    plan.cands |= maps.opened.get(path, 0)
     try:
         function_spans = astdiff.functions(old)
     except Exception:
         function_spans = []
-
-    def methods_within(lo, hi):
-        return maps.entering_any(path, [first for first, _last, _name in function_spans if lo <= first <= hi])
-
+    plan.python.append((path, sites, function_spans))
     for site in sites:
-        kind = site[0]
-        if kind in ("lines", "func"):
-            _, lo, hi, first = site
-            mask = maps.covering(path, lo, hi)
-            entered = maps.entering(path, first)
-            if entered is not None:
-                mask &= entered
-            plan.notes.append("%s:%d-%d in function at %d: %d tests" % (path, lo, hi, first, bin(mask).count("1")))
-            plan.cands |= mask
-        elif kind == "class":
-            _, name, lo, hi, targets = site
-            plan.runtime_only = False
-            if not is_test:
-                plan.imports.add(module_name(path))
-            key = module_name(path) + ":" + name
-            if is_test:
-                mask = maps.inst.get(key, 0) | maps.by_class.get(path + "::" + name.split(".")[0], 0)
-                mask |= methods_within(lo, hi)
-            elif _is_instance_class(maps, key):
-                mask = maps.inst.get(key, 0) | methods_within(lo, hi)
-                reading = maps.readers(targets) if targets else None
-                if reading is not None:
-                    mask &= reading
-                if module_name(path) in maps.base_modules:
-                    mask |= maps.lazy_load
-            else:
-                mask = loaders | (maps.lazy_load if module_name(path) in maps.base_modules else 0)
-            plan.notes.append("%s: class %s body: %d tests" % (path, name, bin(mask).count("1")))
-            plan.cands |= mask
-        else:
-            plan.runtime_only = False
-            if not is_test:
-                plan.imports.add(module_name(path))
-            mask = loaders | (maps.lazy_load if module_name(path) in maps.base_modules else 0)
-            plan.notes.append("%s: module level: %d tests" % (path, bin(mask).count("1")))
-            plan.cands |= mask
+        plan.cands |= site_mask(maps, maps.view, path, site, function_spans, loaders, plan.notes)
+        if site[0] in ("enter", "class", "module") and not is_test:
+            # import-time code changed: check that the module still imports
+            plan.imports.add(module_name(path))
+            if in_base and site[0] != "enter":
+                plan.cands |= maps.lazy_load
+
+
+def query_mask(maps, plan, method):
+    """Queries of a long TPC test that can see the patch: a bit mask, or None
+    when every query has to be assumed affected."""
+    entry = maps.queries.get(method)
+    if entry is None or not plan.plain or not plan.python:
+        return None
+    view = entry[0]
+    mask = 0
+    for path, sites, function_spans in plan.python:
+        if path.startswith("tests/"):
+            return None
+        loaders = view.loading(path)
+        for site in sites:
+            mask |= site_mask(maps, view, path, site, function_spans, loaders)
+    # Code the test reaches only outside its queries (fixtures, the loop itself)
+    # shows up in no query's record: assume all of them then.
+    return mask or None
 
 
 def analyze(maps, patch_bytes, repo):
@@ -266,6 +348,7 @@ def analyze(maps, patch_bytes, repo):
                 plan.notes.append("%s: configuration" % path)
                 continue
         if fp.binary:
+            plan.plain = False
             mask = maps.opened.get(path, 0)
             if is_py and in_code:
                 plan.blind_all = True
@@ -286,8 +369,10 @@ def analyze(maps, patch_bytes, repo):
                 continue
         if fp.deleted:
             plan.files[path] = None
-            plan.runtime_only = False
+            plan.plain = False
             mask = maps.anyline.get(path, 0) | maps.opened.get(path, 0) | maps.by_file.get(path, 0)
+            if base == "__init__.py":
+                mask |= maps.package_users(os.path.dirname(path))
             if is_py and module_name(path) in maps.base_modules:
                 mask |= maps.lazy_load
             if path.startswith("sqlglotc/"):
@@ -303,7 +388,7 @@ def analyze(maps, patch_bytes, repo):
             continue
         plan.files[path] = new
         if fp.created:
-            plan.runtime_only = False
+            plan.plain = False
             if is_py and path.startswith("sqlglot/"):
                 plan.blind_all = True
                 plan.notes.append("%s: new module" % path)
@@ -325,6 +410,8 @@ def analyze(maps, patch_bytes, repo):
             mask = maps.opened.get(path, 0)
             if path.startswith("sqlglotc/"):
                 mask |= maps.by_file.get("tests/test_sqlglotc.py", 0)
+            if mask:
+                plan.plain = False
             plan.cands |= mask
             plan.notes.append("%s: data file read by %d tests" % (path, bin(mask).count("1")))
     return plan

@@ -83,18 +83,26 @@ def pack_cost(numbers, millis):
 DUCK_INPUTS = ("tests/test_executor.py", "tests/helpers.py", "tests/__init__.py", "tests/fixtures/optimizer/tpc-")
 
 
-def through_code_only(plan, index):
-    """True when the patch can reach the test at map index `index` only through
-    sqlglot's own source: every other touched file is a data file the test does
-    not read.  With no index, data files read by any test are still allowed."""
+def through_code_only(plan, maps, mask):
+    """True when the patch can reach the tests in `mask` (a bit mask over the
+    map's tests) only through sqlglot's own source: every other touched file is
+    a data file none of them reads, or an existing test-side module none of
+    them loads."""
     for path in plan.touched:
         if path.startswith("sqlglot/") and path.endswith(".py"):
             continue
-        readers = plan.fixture.get(path)
-        if readers is None or not path.startswith("tests/fixtures/"):
-            return False
-        if index is not None and (readers >> index) & 1:
-            return False
+        if path.startswith("tests/fixtures/") and path in plan.fixture:
+            if plan.fixture[path] & mask:
+                return False
+            continue
+        if path.startswith("tests/") and path.endswith(".py") and plan.files.get(path) is not None and os.path.isfile(os.path.join(REPO, path)):
+            loaders = maps.anyline.get(path, 0) | maps.opened.get(path, 0) | maps.by_file.get(path, 0)
+            if os.path.basename(path) == "__init__.py":
+                loaders |= maps.package_users(os.path.dirname(path))
+            if loaders & mask:
+                return False
+            continue
+        return False
     return True
 
 
@@ -212,7 +220,7 @@ def main(out):
                         continue  # cheap enough to simply run in full with the rest
                     heavy.add(n)
                 elif test_id in proxies.PROXIES and n not in blind:
-                    if not through_code_only(plan, maps.ids.index(test_id) if test_id in maps.ids else None):
+                    if test_id not in maps.ids or not through_code_only(plan, maps, 1 << maps.ids.index(test_id)):
                         # the stand-in only exercises sqlglot's own code: anything
                         # else that reaches the test is not for it to judge
                         plan.blind_numbers.add(n)
@@ -261,7 +269,7 @@ def main(out):
             executor_heavy = {n for n in heavy if n not in plan.proxy}
             # DuckDB's answers for the TPC queries are on record when the patch
             # leaves tests and fixtures alone; the long tests then cost far less
-            duck_ok = bool(fast_queries) and through_code_only(plan, None) and not any(p.startswith(DUCK_INPUTS) for p in plan.touched)
+            duck_ok = bool(fast_queries) and through_code_only(plan, maps, maps.by_file.get("tests/test_executor.py", 0)) and not any(p.startswith(DUCK_INPUTS) for p in plan.touched)
             Q = fast_queries if duck_ok else maps.queries
             exact_budget = EXACT_BUDGET_FAST if duck_ok else EXACT_BUDGET
             # The long TPC tests: which of their queries can see the patch, and

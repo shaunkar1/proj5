@@ -338,15 +338,23 @@ def query_mask(maps, plan, method):
         return None
     view = entry[0]
     mask = 0
+    settings_only = True
     for path, sites, function_spans in plan.python:
         if path.startswith("tests/"):
             return None
         loaders = view.loading(path)
         for site in sites:
             mask |= site_mask(maps, view, path, site, function_spans, loaders)
-    # Code the test reaches only outside its queries (fixtures, the loop itself)
-    # shows up in no query's record: assume all of them then.
-    return mask or None
+            if site[0] != "class" or not site[4]:
+                settings_only = False
+    if mask or settings_only:
+        # A changed class setting matters to a position only if that position
+        # both holds the class and reads the setting; the test as a whole can do
+        # each in different positions, and then none is affected.
+        return mask
+    # Changed code that the test reaches but no single position does is
+    # unexpected: assume every position is affected.
+    return None
 
 
 def analyze(maps, patch_bytes, repo):

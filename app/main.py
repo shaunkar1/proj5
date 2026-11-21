@@ -38,6 +38,7 @@ EXECUTOR_PATHS = ("tests/test_executor.py", "tests/fixtures/optimizer/tpc-")
 MIN_EVIDENCE = 3
 EXACT_BUDGET = 12.0        # CPU seconds worth spending to settle a long TPC test outright
 PROBE_QUERIES = 10         # executing queries to try when a long TPC test cannot be settled
+SETTLE_ODDS = 0.6          # chance that a long test reached by a change still passes
 STRONG_EVIDENCE = 4        # this many cheaper failures select it even after a clean probe
 FAIL_ODDS = 0.5            # chance that a reachable change breaks at least one test
 FAIL_SHARE = 0.3           # share of the candidates' worker time the failing ones need
@@ -207,6 +208,7 @@ def main(out):
             # The long TPC tests: which of their queries can see the patch, and
             # can those be run outright for a firm answer?
             plan.query = {}
+            plan.untouched = set()
             for n in sorted(executor_heavy):
                 method = id_of[n]
                 entry = maps.queries.get(method)
@@ -240,9 +242,14 @@ def main(out):
                     positions = sorted(changed)
                 else:
                     continue
+                if not positions:
+                    plan.untouched.add(n)  # no query or dialect of it sees the change
+                    continue
                 positions.sort(key=lambda k: query_cpu[k])
                 total = base_cpu + sum(query_cpu[k] for k in positions)
                 plan.query[n] = (method, positions, total)
+            executor_heavy -= plan.untouched
+            heavy -= plan.untouched
             settled, spent_exact = set(), 0.0
             for n in sorted(plan.query, key=lambda n: plan.query[n][2]):
                 if spent_exact + plan.query[n][2] <= EXACT_BUDGET:
@@ -278,6 +285,24 @@ def main(out):
                 if plan.probe and not witnesses:
                     unprobed = unprobed | set(plan.probe)
                     plan.probe = {}
+                # With a selection going out anyway, a long test often rides along
+                # on a worker for less than the CPU it takes to settle or probe it.
+                unseen = {n for n in light if n not in witnesses} | unprobed | plan.blind_numbers
+                for n in sorted(settled | set(plan.probe), key=lambda n: seconds[n]):
+                    saving = (pack_cost(unseen | {n}, millis) - pack_cost(unseen, millis)) / 1000.0
+                    if n in settled:
+                        cpu = plan.query[n][2]
+                    else:
+                        method = plan.query[n][0]
+                        cpu = maps.queries[method][2] + sum(query_cpu_of(maps, method, k) for k in plan.probe[n])
+                        cpu += sum(cost_of[w] for w in witnesses) + maps.class_setup.get(tpc.EXECUTOR.rstrip(":"), 0.7)
+                    if cpu > SETTLE_ODDS * saving:
+                        unseen.add(n)
+                        unprobed = unprobed | {n}
+                        settled.discard(n)
+                        plan.probe.pop(n, None)
+                if not plan.probe:
+                    witnesses = []
                 plan.blind_numbers.update(n for n in light if n not in witnesses)
                 plan.blind_numbers.update(unprobed)
                 plan.light = light = witnesses

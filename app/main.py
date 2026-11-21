@@ -38,6 +38,9 @@ EXECUTOR_HEAVY = (
 )
 EXECUTOR_PATHS = ("tests/test_executor.py", "tests/fixtures/optimizer/tpc-")
 MIN_EVIDENCE = 3
+SPIN_SECONDS = 0.0111      # what machine_speed()'s loop takes where the estimates were measured
+SPEED = 1.0
+SLACK = 1.0
 EXACT_BUDGET_FAST = 5.0    # the same, when DuckDB's answers are on record (costs are then measured in-suite)
 EXACT_BUDGET = 12.0        # CPU seconds worth spending to settle a long TPC test outright
 PROBE_QUERIES = 10         # executing queries to try when a long TPC test cannot be settled
@@ -78,6 +81,24 @@ def pack_cost(numbers, millis):
     return max(sum(millis[n] for n in w) for w in workers) + WORKER_MS * len(workers)
 
 
+DUCK_INPUTS = ("tests/test_executor.py", "tests/helpers.py", "tests/__init__.py", "tests/fixtures/optimizer/tpc-")
+
+
+def through_code_only(plan, index):
+    """True when the patch can reach the test at map index `index` only through
+    sqlglot's own source: every other touched file is a data file the test does
+    not read.  With no index, data files read by any test are still allowed."""
+    for path in plan.touched:
+        if path.startswith("sqlglot/") and path.endswith(".py"):
+            continue
+        readers = plan.fixture.get(path)
+        if readers is None or not path.startswith("tests/fixtures/"):
+            return False
+        if index is not None and (readers >> index) & 1:
+            return False
+    return True
+
+
 def query_cpu_of(maps, method, position):
     return maps.queries[method][1][position]
 
@@ -93,7 +114,36 @@ def bits(mask):
     return out
 
 
+def machine_speed():
+    """CPU seconds this machine needs for work that takes one second on the
+    machine the per-test estimates were measured on.  Estimates are compared
+    with simulated seconds, so they have to be in this machine's seconds."""
+    override = os.environ.get("BR_SPEED")
+    if override:
+        return float(override)
+
+    def spin():
+        started = time.process_time()
+        table = {}
+        for i in range(120000):
+            table[i % 997] = (i, str(i), [i])
+        total = 0
+        for key, (number, text, items) in table.items():
+            total += number + len(text) + len(items) + key
+        sorted(table.values(), key=lambda entry: entry[1])
+        return time.process_time() - started
+
+    best = min(spin() for _ in range(3))
+    return min(max(best / SPIN_SECONDS, 0.8), 2.5)
+
+
 def main(out):
+    global SPEED, SLACK
+    SPEED = machine_speed()
+    SLACK = max(1.0, SPEED)  # wall-clock allowances stretch on a slower machine, never shrink
+    import gc
+
+    gc.disable()  # short-lived, and syntax trees are all cycles: collecting them is wasted work
     import analyze
     import overlay
     import proxies
@@ -180,7 +230,7 @@ def main(out):
                         continue  # cheap enough to simply run in full with the rest
                     heavy.add(n)
                 elif test_id in proxies.PROXIES and n not in blind:
-                    if not all(p.startswith("sqlglot/") and p.endswith(".py") for p in plan.touched):
+                    if not through_code_only(plan, maps.ids.index(test_id) if test_id in maps.ids else None):
                         # the stand-in only exercises sqlglot's own code: anything
                         # else that reaches the test is not for it to judge
                         plan.blind_numbers.add(n)
@@ -229,7 +279,7 @@ def main(out):
             executor_heavy = {n for n in heavy if n not in plan.proxy}
             # DuckDB's answers for the TPC queries are on record when the patch
             # leaves tests and fixtures alone; the long tests then cost far less
-            duck_ok = bool(fast_queries) and all(p.startswith("sqlglot/") and p.endswith(".py") for p in plan.touched)
+            duck_ok = bool(fast_queries) and through_code_only(plan, None) and not any(p.startswith(DUCK_INPUTS) for p in plan.touched)
             Q = fast_queries if duck_ok else maps.queries
             exact_budget = EXACT_BUDGET_FAST if duck_ok else EXACT_BUDGET
             # The long TPC tests: which of their queries can see the patch, and
@@ -279,7 +329,7 @@ def main(out):
             heavy -= plan.untouched
             settled, spent_exact = set(), 0.0
             for n in sorted(plan.query, key=lambda n: plan.query[n][2]):
-                if spent_exact + plan.query[n][2] <= exact_budget:
+                if (spent_exact + plan.query[n][2]) * SPEED <= exact_budget:
                     settled.add(n)
                     spent_exact += plan.query[n][2]
             unsettled = executor_heavy - settled
@@ -301,9 +351,9 @@ def main(out):
             blind_cost = pack_cost(set(light) | unprobed | plan.blind_numbers, millis) / 1000.0
             cpu_cost = 0.08 + sum(cost_of[n] for n in light)
             cpu_cost += sum(maps.class_setup.get(c, 0.02) for c in {id_of[n].rsplit("::", 1)[0] for n in light})
-            run_cost = cpu_cost + FAIL_ODDS * (2.0 + FAIL_SHARE * max(blind_cost - 2.0, 0.0))
+            run_cost = cpu_cost * SPEED + FAIL_ODDS * (2.0 + FAIL_SHARE * max(blind_cost - 2.0, 0.0))
             plan.ran_light = True
-            if light and run_cost > blind_cost:
+            if light and run_cost > blind_cost and not os.environ.get("BR_NOBLIND"):
                 log(commit, "cheaper to select %d candidates unseen (%.1f s) than to run them (%.1f s)" % (len(light) + len(unprobed), blind_cost, run_cost))
                 # A probe alone is not trusted: the cheap executor tests that reach
                 # the change still run, as witnesses.  With none of those, a probed
@@ -323,7 +373,7 @@ def main(out):
                         method = plan.query[n][0]
                         cpu = Q[method][2] + sum(Q[method][1][k] for k in plan.probe[n])
                         cpu += sum(cost_of[w] for w in witnesses) + maps.class_setup.get(tpc.EXECUTOR.rstrip(":"), 0.7)
-                    if cpu > SETTLE_ODDS * saving:
+                    if cpu * SPEED > SETTLE_ODDS * saving:
                         unseen.add(n)
                         unprobed = unprobed | {n}
                         settled.discard(n)
@@ -354,7 +404,7 @@ def main(out):
                     continue
                 query_entries.append((n, runner.PROXY + "query:%s|%s" % (method, ",".join(map(str, sorted(chosen))))))
                 expected = Q[method][2] + sum(Q[method][1][k] for k in chosen)
-                query_budget[n] = max(10.0, 3.0 * expected + 5.0)
+                query_budget[n] = max(10.0, 3.0 * expected + 5.0) * SLACK
             entries = [(n, id_of[n]) for n in light]
             entries += [(n, runner.PROXY + test_id) for n, test_id in sorted(plan.proxy.items())]
             entries += query_entries
@@ -367,7 +417,7 @@ def main(out):
             copies = ["tests/test_sqlglotc.py"] if any(p.startswith("sqlglotc/") for p in plan.touched) else []
             overlay.remove(root)
             overlay.build(REPO, root, plan.files, copies)
-            budgets = {n: max(4.0, 6.0 * max(estimate[n], seconds[n]) + 2.0) for n in light}
+            budgets = {n: max(4.0, 6.0 * max(estimate[n], seconds[n]) + 2.0) * SLACK for n in light}
             for n in plan.proxy:
                 budgets[n] = 25.0
             for n, _entry in query_entries:
@@ -446,7 +496,7 @@ def main(out):
                 if exact is False:
                     # probed and clean: left out unless many cheaper tests fail,
                     # or the probe itself ran far slower than it should
-                    slow = job is not None and job.elapsed.get(n, 0.0) > 2.0 * plan.probe_cpu.get(n, 0.0) + 2.0
+                    slow = job is not None and job.elapsed.get(n, 0.0) > (2.0 * plan.probe_cpu.get(n, 0.0) + 2.0) * SLACK
                     if strong or slow:
                         selected.add(n)
                 elif evidence:
@@ -461,6 +511,7 @@ def main(out):
                     "probe": {id_of[n].rsplit("::", 1)[-1]: ("fail" if job is not None and n in job.failed else "pass") for n in getattr(plan, "probe", {})}}))
                 log(commit, "cands=%d ran=%d failed=%d selected=%d cpu=%.2f rec=%.2f est=%.2f" % (len(plan.numbers), len(plan.light), len(light_failed), len(selected), job.cpu if job else 0, sum(seconds[n] for n in plan.light), job.estimate if job else 0), "|", "; ".join(plan.notes))
                 if job and os.environ.get("BR_TRACE"):
+                    log(commit, "failed:", ", ".join(sorted(id_of.get(n, str(n)).split("::")[-1] for n in light_failed))[:600])
                     top = sorted(job.elapsed.items(), key=lambda kv: -kv[1])[:6]
                     log(commit, "trace: in tests %.2f s of %.2f s cpu;" % (sum(job.elapsed.values()), job.cpu), ", ".join("%s %.2f" % (id_of.get(n, str(n)).split("::")[-1], e) for n, e in top))
             answer(commit, selected)

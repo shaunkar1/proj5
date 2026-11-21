@@ -7,6 +7,7 @@ or any of its subtests fails or errors, when its class or module fixture
 fails, when its file cannot be imported, or when it hangs or kills the child.
 """
 
+import gc
 import importlib
 import os
 import select
@@ -41,6 +42,7 @@ class _Result(unittest.TestResult):
         self._index_of = index_of
         self._failed = False
         self._current = None
+        self._collected = time.monotonic()
 
     def stop(self):  # failfast must not stop the remaining tests
         pass
@@ -69,6 +71,11 @@ class _Result(unittest.TestResult):
                 self._emit("T %d %.4f\n" % (self._current, time.process_time() - self._t0))
             self._emit("%s %d\n" % ("F" if self._failed else "P", self._current))
         self._current = None
+        if not gc.isenabled():
+            now = time.monotonic()
+            if now - self._collected > 0.5:
+                gc.collect(0)  # what the tests since the last pass left behind
+                self._collected = time.monotonic()
 
     def _bad(self, test):
         if isinstance(test, unittest.TestCase) and test.id() in self._index_of:
@@ -154,6 +161,11 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None
     def emit(text):
         os.write(wfd, text.encode())
 
+    # The parent's objects are never garbage here: keep the collector off them,
+    # and collect between tests (see _Result) instead of all through them.
+    if os.environ.get("BR_GC") != "auto":
+        gc.freeze()
+        gc.disable()
     os.chdir(root)
     sys.path.insert(0, root)
     os.environ["SKIP_INTEGRATION"] = "0"
@@ -245,6 +257,11 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None
             suite.run(result)
     except BaseException:
         pass
+    if os.environ.get("BR_RSSLOG"):
+        import resource
+
+        with open(os.environ["BR_RSSLOG"], "a") as handle:
+            handle.write("%s %d MB peak, %d tests\n" % (os.path.basename(root), resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024, len(index_of)))
     stand_ins = [(index, test_id) for index, test_id in stand_ins if not test_id.startswith("query:")]
     if stand_ins:
         import proxies

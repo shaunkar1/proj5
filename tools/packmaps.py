@@ -172,6 +172,12 @@ if len(sys.argv) > 6:
         for f in set(sub["lines"]) | set(sub["started"]):
             sub_files[f] = (pack({int(l): int(m, 16) for l, m in sub["lines"].get(f, {}).items()}),
                             pack({int(l): int(m, 16) for l, m in sub["started"].get(f, {}).items()}))
+        # per-position timings are noisy when positions are tiny: make them add up
+        # to what the whole test measures
+        whole = timing["tests"].get(method)
+        if whole is not None and sum(sub["cpu"]) > max(whole - sub["base_cpu"], 0.0) > 0.0:
+            factor = max(whole - sub["base_cpu"], 0.0) / sum(sub["cpu"])
+            sub["cpu"] = [round(c * factor, 5) for c in sub["cpu"]]
         queries[method] = {"n": sub["n"], "cpu": sub["cpu"], "base_cpu": sub["base_cpu"], "files": sub_files,
                            "inst": {c: int(m, 16) for c, m in sub["inst"].items()}}
         print("queries", method, sub["n"], "cpu", round(sum(sub["cpu"]), 1))
@@ -187,7 +193,8 @@ index = {
     "instantiated_at_import": ip["instantiated"],
     "holders": ip["holders"],
     "times": [times.get(ids[i]) for i in range(n)],
-    "class_setup": timing["classes"],
+    # what a class adds beyond starting a process: the cheapest class is all start-up
+    "class_setup": {c: round(max(v - min(timing["classes"].values()), 0.0), 3) for c, v in timing["classes"].items()} if timing["classes"] else {},
     "ids": ids,
     "cpu": [records[i]["cpu"] for i in range(n)],
     "opened": opened,

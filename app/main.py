@@ -266,7 +266,7 @@ def main(out):
             unprobed = unsettled - set(plan.probe)
             blind_cost = pack_cost(set(light) | unprobed | plan.blind_numbers, millis) / 1000.0
             cpu_cost = 0.08 + sum(cost_of[n] for n in light)
-            cpu_cost += sum(maps.class_setup.get(c, 0.05) for c in {id_of[n].rsplit("::", 1)[0] for n in light})
+            cpu_cost += sum(maps.class_setup.get(c, 0.02) for c in {id_of[n].rsplit("::", 1)[0] for n in light})
             run_cost = cpu_cost + FAIL_ODDS * (2.0 + FAIL_SHARE * max(blind_cost - 2.0, 0.0))
             plan.ran_light = True
             if light and run_cost > blind_cost:

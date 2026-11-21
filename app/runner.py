@@ -181,6 +181,29 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None
     broken_modules = set()
     stand_ins = [(index, test_id[len(PROXY):]) for index, test_id in tests if test_id.startswith(PROXY)]
     tests = [(index, test_id) for index, test_id in tests if not test_id.startswith(PROXY)]
+    # looping tests thinned to the part the patch can reach, "<test id>|<positions>":
+    # they join the ordinary tests so that class fixtures are set up once
+    query_runs = [(index, spec[len("query:"):]) for index, spec in stand_ins if spec.startswith("query:")]
+    thinned = {}
+    if query_runs:
+        try:
+            import tpc
+
+            selection, modules = {}, {}
+            for index, spec in query_runs:
+                test_id, _, positions = spec.rpartition("|")
+                selection[test_id] = {int(p) for p in positions.split(",") if p}
+                modules[tpc.TARGETS[test_id][0]] = importlib.import_module(tpc.TARGETS[test_id][0])
+            tpc.thin(modules, selection)
+            if "tests.test_executor" in modules:
+                short_tables = False  # the thinning decides which tables load in full
+            for index, spec in query_runs:
+                thinned[index] = spec.rpartition("|")[0]
+            tests = sorted(tests + [(index, test_id) for index, test_id in thinned.items()], key=lambda entry: (entry[1].split("::")[0], entry[0] if entry[0] >= 0 else 10**9))
+        except BaseException:
+            for index, _spec in query_runs:
+                emit("F %d\n" % index)
+            thinned = {}
     for index, test_id in tests:
         module_name, class_name, method = split_id(test_id)
         if module_name in broken_modules:
@@ -208,31 +231,7 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None
         suite.run(result)
     except BaseException:
         pass
-    query_runs = [(index, test_id[len("query:"):]) for index, test_id in stand_ins if test_id.startswith("query:")]
     stand_ins = [(index, test_id) for index, test_id in stand_ins if not test_id.startswith("query:")]
-    if query_runs:
-        # looping tests, thinned to the part the patch can reach: "<test id>|<positions>"
-        try:
-            import tpc
-
-            selection, modules = {}, {}
-            for index, spec in query_runs:
-                test_id, _, positions = spec.rpartition("|")
-                selection[test_id] = {int(p) for p in positions.split(",") if p}
-                modules[tpc.TARGETS[test_id][0]] = importlib.import_module(tpc.TARGETS[test_id][0])
-            tpc.thin(modules, selection)
-            cases = unittest.TestSuite()
-            case_index = {}
-            for index, spec in query_runs:
-                test_id = spec.rpartition("|")[0]
-                module_name, class_name, method = tpc.TARGETS[test_id][:3]
-                case = getattr(modules[module_name], class_name)(method)
-                case_index[case.id()] = index
-                cases.addTest(case)
-            cases.run(_Result(emit, case_index))
-        except BaseException:
-            for index, _spec in query_runs:
-                emit("F %d\n" % index)
     if stand_ins:
         import proxies
 

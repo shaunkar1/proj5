@@ -301,7 +301,8 @@ def main(out):
                 else:
                     continue
                 query_entries.append((n, runner.PROXY + "query:%s|%s" % (method, ",".join(map(str, sorted(chosen))))))
-                query_budget[n] = 30.0 + 6.0 * total
+                expected = maps.queries[method][2] + sum(query_cpu_of(maps, method, k) for k in chosen)
+                query_budget[n] = max(10.0, 3.0 * expected + 5.0)
             entries = [(n, id_of[n]) for n in light]
             entries += [(n, runner.PROXY + test_id) for n, test_id in sorted(plan.proxy.items())]
             entries += query_entries
@@ -399,6 +400,13 @@ def main(out):
                 elif evidence:
                     selected.add(n)
             if VERBOSE:
+                where = {}
+                for n in light_failed:
+                    if n >= 0:
+                        key = id_of[n].split("::")[0].rsplit("/", 1)[-1]
+                        where[key] = where.get(key, 0) + 1
+                log(commit, "evidence", json.dumps({"failed_in": where, "mode": "run" if getattr(plan, "ran_light", False) else "blind",
+                    "probe": {id_of[n].rsplit("::", 1)[-1]: ("fail" if job is not None and n in job.failed else "pass") for n in getattr(plan, "probe", {})}}))
                 log(commit, "cands=%d ran=%d failed=%d selected=%d cpu=%.2f rec=%.2f" % (len(plan.numbers), len(plan.light), len(light_failed), len(selected), job.cpu if job else 0, sum(seconds[n] for n in plan.light)), "|", "; ".join(plan.notes))
             answer(commit, selected)
     except Exception as error:

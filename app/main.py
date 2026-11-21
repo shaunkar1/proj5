@@ -155,8 +155,10 @@ def main(out):
                         continue  # cheap enough to simply run in full with the rest
                     heavy.add(n)
                 elif test_id in proxies.PROXIES and n not in blind:
-                    if test_id.split("::", 1)[0] in plan.touched:
-                        plan.blind_numbers.add(n)  # the test itself changed: no stand-in
+                    if not all(p.startswith("sqlglot/") and p.endswith(".py") for p in plan.touched):
+                        # the stand-in only exercises sqlglot's own code: anything
+                        # else that reaches the test is not for it to judge
+                        plan.blind_numbers.add(n)
                     else:
                         heavy.add(n)
                         plan.proxy[n] = test_id

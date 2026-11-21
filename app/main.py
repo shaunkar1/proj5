@@ -26,7 +26,6 @@ VERBOSE = os.environ.get("BR_VERBOSE") == "1"
 
 WORKER_MS = 2000
 MAX_WORKERS = 8
-SECONDS_PER_COMMIT = 4.5   # the wall-clock allowance works out to this
 
 MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 GENERATOR_MEMORY = "tests/test_generator.py::TestGenerator::test_generator_memory"
@@ -121,7 +120,9 @@ def main(out):
                 estimate[number_of[test_id]] = maps.times[i]
         # tests the maps know nothing about are treated as reachable from anything
         unknown = [n for test_id, n in number_of.items() if test_id not in set(maps.ids)]
-        stop_at = START + 0.62 * SECONDS_PER_COMMIT * max(len(commits), 1)
+        # the batch has 3 minutes of wall clock (4.5 in the final, which is about
+        # one and a half times as large); stop running tests well before that
+        stop_at = START + 0.62 * (180.0 if len(commits) <= 48 else 270.0)
 
         plans = {}
         query_budget = {}
@@ -208,12 +209,36 @@ def main(out):
             for n in sorted(executor_heavy):
                 method = id_of[n]
                 entry = maps.queries.get(method)
-                stable = not any(p.startswith(tpc.UNSTABLE[method]) for p in plan.touched)
-                if entry is None or not stable or n in plan.blind_numbers:
+                if entry is None or n in plan.blind_numbers:
                     continue
                 view, query_cpu, base_cpu = entry
-                mask = analyze.query_mask(maps, plan, method)
-                positions = bits(mask) if mask is not None else list(range(view.size))
+                unstable = [p for p in plan.touched if p.startswith(tpc.UNSTABLE[method])]
+                attr = tpc.TARGETS[method][3]
+                fixture_path = "tests/fixtures/" + tpc.FIXTURES[attr] if attr else None
+                index = maps.ids.index(method)
+                if not unstable:
+                    if (plan.other_mask >> index) & 1 or not plan.fixture:
+                        mask = analyze.query_mask(maps, plan, method)
+                    else:
+                        mask = 0  # here only through a fixture file it shares a fixture with
+                        for path, readers in plan.fixture.items():
+                            if (readers >> index) & 1 and not path.startswith("tests/fixtures/optimizer/tpc-"):
+                                mask = None
+                    positions = bits(mask) if mask is not None else list(range(view.size))
+                elif unstable == [fixture_path] and fixture_path in plan.fixture and not (plan.other_mask >> index) & 1:
+                    # only its own query file changed: the queries whose text
+                    # differs from the pinned file are the ones to run
+                    try:
+                        with open(os.path.join(REPO, fixture_path), "rb") as handle:
+                            pinned_text = handle.read().decode("utf-8")
+                        changed = tpc.changed_positions(pinned_text, plan.files[fixture_path].decode("utf-8"))
+                    except Exception:
+                        changed = None
+                    if changed is None:
+                        continue
+                    positions = sorted(changed)
+                else:
+                    continue
                 positions.sort(key=lambda k: query_cpu[k])
                 total = base_cpu + sum(query_cpu[k] for k in positions)
                 plan.query[n] = (method, positions, total)
@@ -309,6 +334,10 @@ def main(out):
             if job is not None:
                 unfinished = bool(job.pending)
                 light_failed = {n for n in job.failed if n >= 0 and n not in plan.proxy and n not in plan.query}
+                # a test that is here only because its fixture file changed says
+                # nothing about what the code change does to other tests
+                fixture_only = {number_of[maps.ids[i]] for i in bits(plan.cands & ~plan.other_mask) if maps.ids[i] in number_of}
+                light_failed -= fixture_only
                 selected |= {n for n in job.failed if n >= 0}        # failed tests and stand-ins
                 selected |= {n for n, _ in job.pending if n >= 0}    # never got to run
                 for k, module in plan.smoke.items():

@@ -23,9 +23,9 @@ TARGETS = {
 }
 # a patch touching any of these changes what the positions mean
 UNSTABLE = {
-    EXECUTOR + "test_execute_tpcds": ("tests/test_executor.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-"),
-    EXECUTOR + "test_execute_tpch": ("tests/test_executor.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-"),
-    EXECUTOR + "test_optimized_tpch": ("tests/test_executor.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-"),
+    EXECUTOR + "test_execute_tpcds": ("tests/test_executor.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-ds/"),
+    EXECUTOR + "test_execute_tpch": ("tests/test_executor.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-h/"),
+    EXECUTOR + "test_optimized_tpch": ("tests/test_executor.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-h/"),
     GENERATOR_MEMORY: ("tests/test_generator.py", "sqlglot/dialects/__init__.py", "sqlglot/dialects/dialect.py"),
 }
 FIXTURES = {"tpcds_sqls": "optimizer/tpc-ds/tpc-ds.sql", "tpch_sqls": "optimizer/tpc-h/tpc-h.sql"}
@@ -48,6 +48,22 @@ class _SomeTablesCsv:
         if table in self.full:
             return rows
         return itertools.islice(rows, 2)
+
+
+def fixture_pairs(text):
+    """The (sql, expected) texts tests/helpers.py's load_sql_fixture_pairs yields for a fixture."""
+    kept = "\n".join(line for line in text.splitlines() if line and not line.startswith("--"))
+    statements = kept.split(";")
+    return [(statements[i].strip(), statements[i + 1].strip()) for i in range(0, len(statements) - 1, 2)]
+
+
+def changed_positions(pinned_text, patched_text):
+    """Positions whose pair differs between two versions of a fixture, or None
+    when the pairs no longer line up."""
+    old, new = fixture_pairs(pinned_text), fixture_pairs(patched_text)
+    if len(old) != len(new):
+        return None
+    return {i for i, (a, b) in enumerate(zip(old, new)) if a != b}
 
 
 def size(test_id, module):

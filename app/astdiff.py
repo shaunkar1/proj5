@@ -26,7 +26,29 @@ _FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 _BLOCKS = (ast.stmt, ast.ExceptHandler, ast.match_case)
 
 
+_LINES = [None, None]  # source lines of the old and the new file being compared
+
+
+def _text(node, lines):
+    """Source text of a node, or None when it has no position."""
+    lo = getattr(node, "lineno", None)
+    hi = getattr(node, "end_lineno", None)
+    if lo is None or hi is None or lines is None:
+        return None
+    for dec in getattr(node, "decorator_list", ()):
+        lo = min(lo, dec.lineno)
+    if lo == hi:
+        return lines[lo - 1][node.col_offset : node.end_col_offset] if not getattr(node, "decorator_list", None) else lines[lo - 1]
+    chunk = lines[lo - 1 : hi]
+    return (chunk[0][node.col_offset :] if not getattr(node, "decorator_list", None) else chunk[0], chunk[1:-1], chunk[-1][: node.end_col_offset])
+
+
 def _same(a, b):
+    if type(a) is not type(b):
+        return False
+    ta = _text(a, _LINES[0])
+    if ta is not None and ta == _text(b, _LINES[1]):
+        return True  # same kind of node from the same text
     return ast.dump(a) == ast.dump(b)
 
 
@@ -153,10 +175,22 @@ def diff(old_source, new_source):
         new_tree = ast.parse(new_source)
     except ValueError as error:
         raise SyntaxError(str(error))
-    if _same(old_tree, new_tree):
-        return []
+
+    def lines_of(source):
+        if isinstance(source, bytes):
+            # positions in the tree count UTF-8 bytes within a line
+            return source.splitlines()
+        return [line.encode("utf-8") for line in source.splitlines()]
+
+    try:
+        _LINES[0], _LINES[1] = lines_of(old_source), lines_of(new_source)
+    except Exception:
+        _LINES[0] = _LINES[1] = None
     out = []
-    _walk(old_tree, new_tree, [], out)
+    try:
+        _walk(old_tree, new_tree, [], out)
+    finally:
+        _LINES[0] = _LINES[1] = None
     seen = []
     for site in out:
         if site not in seen:

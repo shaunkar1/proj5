@@ -1,0 +1,48 @@
+"""Record which lines run while every sqlglot module is imported (pinned commit, offline)."""
+import importlib, json, os, pkgutil, sys
+import coverage
+
+ROOT = os.getcwd()
+OUT = os.environ["MAP_OUT"]
+sys.path.insert(0, ROOT)
+cov = coverage.Coverage(data_file=None, source=[os.path.join(ROOT, "sqlglot")], config_file=False)
+started = set()
+mon = sys.monitoring
+mon.use_tool_id(4, "started")
+def on_start(code, offset):
+    f = code.co_filename
+    if f.startswith(ROOT + os.sep) and code.co_name != "<module>":
+        started.add((os.path.relpath(f, ROOT), code.co_firstlineno, code.co_name))
+    return mon.DISABLE
+mon.register_callback(4, mon.events.PY_START, on_start)
+mon.set_events(4, mon.events.PY_START)
+cov.start()
+import sqlglot
+base = sorted(m for m in sys.modules if m == "sqlglot" or m.startswith("sqlglot."))
+for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+    if info.name.endswith("__main__"):
+        continue
+    importlib.import_module(info.name)
+from sqlglot.dialects.dialect import Dialect, Dialects
+for d in Dialects:
+    Dialect.get_or_raise(d.value) if d.value else None
+cov.stop()
+mon.set_events(4, 0)
+data = cov.get_data()
+lines = {os.path.relpath(f, ROOT): sorted(data.lines(f) or []) for f in data.measured_files()}
+# class -> module-qualified names of every sqlglot class, with its bases, for subclass lookups
+classes = {}
+for name, mod in list(sys.modules.items()):
+    if not (name == "sqlglot" or name.startswith("sqlglot.")) or mod is None:
+        continue
+    stack = [v for v in vars(mod).values() if isinstance(v, type) and v.__module__ == name]
+    seen = set()
+    while stack:
+        c = stack.pop()
+        if c in seen:
+            continue
+        seen.add(c)
+        classes[c.__module__ + ":" + c.__qualname__] = [b.__module__ + ":" + b.__qualname__ for b in c.__mro__[1:] if b.__module__.startswith("sqlglot")]
+        stack.extend(v for v in vars(c).values() if isinstance(v, type) and v.__module__ == name)
+json.dump({"started": sorted(started), "import_lines": lines, "base_modules": base, "classes": classes}, open(os.path.join(OUT, "importpass.json"), "w"))
+print(len(lines), "files", sum(map(len, lines.values())), "import-time lines", len(base), "base modules", len(classes), "classes")

@@ -38,7 +38,6 @@ EXECUTOR_HEAVY = (
 )
 EXECUTOR_PATHS = ("tests/test_executor.py", "tests/fixtures/optimizer/tpc-")
 MIN_EVIDENCE = 3
-SPIN_SECONDS = 0.0111      # what machine_speed()'s loop takes where the estimates were measured
 SPEED = 1.0
 SLACK = 1.0
 EXACT_BUDGET_FAST = 5.0    # the same, when DuckDB's answers are on record (costs are then measured in-suite)
@@ -115,27 +114,11 @@ def bits(mask):
 
 
 def machine_speed():
-    """CPU seconds this machine needs for work that takes one second on the
-    machine the per-test estimates were measured on.  Estimates are compared
-    with simulated seconds, so they have to be in this machine's seconds."""
-    override = os.environ.get("BR_SPEED")
-    if override:
-        return float(override)
-
-    def spin():
-        started = time.process_time()
-        table = {}
-        for i in range(120000):
-            table[i % 997] = (i, str(i), [i])
-        total = 0
-        for key, (number, text, items) in table.items():
-            total += number + len(text) + len(items) + key
-        sorted(table.values(), key=lambda entry: entry[1])
-        return time.process_time() - started
-
-    best = min(spin() for _ in range(5))
-    # in quarter steps, so that timing noise does not move decisions between runs
-    return min(max(round(4.0 * best / SPIN_SECONDS) / 4.0, 0.75), 2.5)
+    """Factor applied to CPU estimates before they are weighed against simulated
+    seconds.  Measuring it at start-up (a timing loop) was tried and scored
+    worse: it leaned toward selecting unseen, which costs more worker time
+    than the CPU it saves.  Estimates are used as measured."""
+    return float(os.environ.get("BR_SPEED") or 1.0)
 
 
 def main(out):
@@ -352,6 +335,8 @@ def main(out):
             cpu_cost += sum(maps.class_setup.get(c, 0.02) for c in {id_of[n].rsplit("::", 1)[0] for n in light})
             run_cost = cpu_cost * SPEED + FAIL_ODDS * (2.0 + FAIL_SHARE * max(blind_cost - 2.0, 0.0))
             plan.ran_light = True
+            if os.environ.get("BR_TRACE"):
+                log(commit, "weigh cpu %.2f blind %.2f" % (cpu_cost, blind_cost))
             if light and run_cost > blind_cost and not os.environ.get("BR_NOBLIND"):
                 log(commit, "cheaper to select %d candidates unseen (%.1f s) than to run them (%.1f s)" % (len(light) + len(unprobed), blind_cost, run_cost))
                 # A probe alone is not trusted: the cheap executor tests that reach

@@ -50,5 +50,32 @@ for name, mod in list(sys.modules.items()):
         seen.add(c)
         classes[c.__module__ + ":" + c.__qualname__] = [b.__module__ + ":" + b.__qualname__ for b in c.__mro__[1:] if b.__module__.startswith("sqlglot")]
         stack.extend(v for v in vars(c).values() if isinstance(v, type) and v.__module__ == name)
-json.dump({"instantiated": sorted(instantiated), "started": sorted(started), "import_lines": lines, "base_modules": base, "classes": classes}, open(os.path.join(OUT, "importpass.json"), "w"))
+# A dialect class reaches its tokenizer, parser and generator classes as plain
+# attributes, without making an instance of them.  For every class: the dialect
+# classes that hold it, or a subclass of it, that way.
+from sqlglot.dialects.dialect import Dialect as _Dialect
+def _key(c):
+    return c.__module__ + ":" + c.__qualname__
+def _all_subclasses(c, seen=None):
+    seen = seen if seen is not None else set()
+    for sub in c.__subclasses__():
+        if sub not in seen:
+            seen.add(sub)
+            _all_subclasses(sub, seen)
+    return seen
+holders = {}
+for dialect in [_Dialect] + sorted(_all_subclasses(_Dialect), key=_key):
+    for attr in dir(dialect):
+        if attr.startswith("__"):
+            continue
+        try:
+            value = getattr(dialect, attr)
+        except Exception:
+            continue
+        if isinstance(value, type) and value.__module__.startswith("sqlglot") and not issubclass(value, _Dialect):
+            for ancestor in value.__mro__:
+                if ancestor.__module__.startswith("sqlglot"):
+                    holders.setdefault(_key(ancestor), set()).add(_key(dialect))
+print(len(holders), "classes held by dialect classes")
+json.dump({"holders": {k: sorted(v) for k, v in holders.items()}, "instantiated": sorted(instantiated), "started": sorted(started), "import_lines": lines, "base_modules": base, "classes": classes}, open(os.path.join(OUT, "importpass.json"), "w"))
 print(len(lines), "files", sum(map(len, lines.values())), "import-time lines", len(base), "base modules", len(classes), "classes")

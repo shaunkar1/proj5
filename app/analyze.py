@@ -133,6 +133,7 @@ class Maps:
         self.preload = data["preload"]
         self.at_import = set(data.get("instantiated_at_import", ()))
         self.thinnable = set(data.get("thinnable", ()))
+        self.holders = data.get("holders", {})
         refs = data.get("refs", {})
         self.view = View(len(self.ids), data["files"], data["inst"], refs)
         self.all = self.view.all
@@ -228,6 +229,10 @@ def site_mask(maps, view, path, site, function_spans, loaders, notes=None):
                 mask = loaders
         elif _is_instance_class(maps, key):
             mask = view.inst.get(key, 0) | methods
+            # a dialect reads settings of its tokenizer, parser and generator
+            # classes without making instances of them
+            for holder in maps.holders.get(key, ()):
+                mask |= view.inst.get(holder, 0)
             # Instances made while modules are imported could carry the old
             # value into import-time state; then nothing can be narrowed.
             reading = view.readers(targets, True) if targets and key not in maps.at_import else None

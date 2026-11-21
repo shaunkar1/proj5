@@ -134,11 +134,6 @@ def visit(rel, node, func, targets, block):
 
 for rel, tree in trees.items():
     visit(rel, tree, None, None, None)
-# a value read in a statement that stores attributes flows into those attributes;
-# read anywhere else in such a function, it may flow into any attribute the function stores
-for (func, _), (read, stored) in statements.items():
-    for name in read:
-        edges[name].update(stored if stored else stores_in.get(func, ()))
 refs = {}
 for name in names:
     if name in blocked or len(readers[name]) > 400:
@@ -168,6 +163,7 @@ index = {
     "queries": queries,
     "refs": refs,
     "instantiated_at_import": ip["instantiated"],
+    "holders": ip["holders"],
     "times": [times.get(ids[i]) for i in range(n)],
     "class_setup": timing["classes"],
     "ids": ids,

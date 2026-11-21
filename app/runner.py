@@ -17,6 +17,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLOSE_IN_CHILD = []  # descriptors a child must not keep (the answer stream)
+PINNED_FIXTURES = None  # tests/fixtures of the pinned tree, set by the caller
 PROXY = "proxy:"
 
 
@@ -30,8 +31,9 @@ def split_id(test_id):
 class _Result(unittest.TestResult):
     """Reports each test's outcome to the parent as it happens."""
 
-    def __init__(self, emit, index_of):
+    def __init__(self, emit, index_of, thin=None):
         super().__init__()
+        self._thin = thin or {}
         self._timing = bool(os.environ.get("BR_TIMES"))
         self._t0 = 0.0
         self.failfast = True  # makes a failed subtest end its test early
@@ -49,11 +51,19 @@ class _Result(unittest.TestResult):
         self._current = self._index_of.get(test.id())
         if self._current is not None:
             self._emit("S %d\n" % self._current)
+        if self._thin:
+            import thinload
+
+            thinload.begin(self._thin.get(test.id()))
         if self._timing:
             self._t0 = time.process_time()
 
     def stopTest(self, test):
         super().stopTest(test)
+        if self._thin:
+            import thinload
+
+            thinload.end()
         if self._current is not None:
             if self._timing:
                 self._emit("T %d %.4f\n" % (self._current, time.process_time() - self._t0))
@@ -126,7 +136,7 @@ def _limit_duckdb_threads():
     duckdb.connect = connect
 
 
-def child_main(root, tests, wfd, extra_setup=None, short_tables=False):
+def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None):
     """Runs in the forked child.  `tests` is a list of (index, test_id)."""
     for fd in CLOSE_IN_CHILD:
         try:
@@ -157,6 +167,15 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False):
     if extra_setup is not None:
         extra_setup()
 
+    thin_by_case = {}
+    if thin:
+        # filter what the fixture loaders give to the tests named in `thin`
+        try:
+            import thinload
+
+            thinload.install(importlib.import_module("tests.helpers"), PINNED_FIXTURES)
+        except BaseException:
+            thin = None
     suite = unittest.TestSuite()
     index_of = {}
     broken_modules = set()
@@ -179,8 +198,10 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False):
             emit("F %d\n" % index)
             continue
         index_of[case.id()] = index
+        if thin and test_id in thin:
+            thin_by_case[case.id()] = thin[test_id]
         suite.addTest(case)
-    result = _Result(emit, index_of)
+    result = _Result(emit, index_of, thin_by_case)
     try:
         suite.run(result)
     except BaseException:
@@ -229,8 +250,9 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False):
 class Job:
     """One child process working through a list of tests."""
 
-    def __init__(self, key, root, tests, budgets, extra_setup=None, short_tables=False):
+    def __init__(self, key, root, tests, budgets, extra_setup=None, short_tables=False, thin=None):
         self.short_tables = short_tables
+        self.thin = thin
         self.key = key
         self.root = root
         self.pending = list(tests)  # (index, test_id), in running order
@@ -256,7 +278,7 @@ class Job:
             try:
                 os.close(rfd)
                 os.setpgid(0, 0)
-                child_main(self.root, self.pending, wfd, self.extra_setup, self.short_tables)
+                child_main(self.root, self.pending, wfd, self.extra_setup, self.short_tables, self.thin)
             except BaseException:
                 pass
             finally:

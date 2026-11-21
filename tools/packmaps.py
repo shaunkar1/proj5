@@ -161,7 +161,10 @@ if len(sys.argv) > 6:
                            "inst": {c: int(m, 16) for c, m in sub["inst"].items()}}
         print("queries", method, sub["n"], "cpu", round(sum(sub["cpu"]), 1))
 
+thinnable = json.load(open(sys.argv[7])) if len(sys.argv) > 7 else []
+
 index = {
+    "thinnable": thinnable,
     "queries": queries,
     "refs": refs,
     "instantiated_at_import": ip["instantiated"],

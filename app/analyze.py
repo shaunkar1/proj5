@@ -132,6 +132,7 @@ class Maps:
         self.classes = data["classes"]
         self.preload = data["preload"]
         self.at_import = set(data.get("instantiated_at_import", ()))
+        self.thinnable = set(data.get("thinnable", ()))
         refs = data.get("refs", {})
         self.view = View(len(self.ids), data["files"], data["inst"], refs)
         self.all = self.view.all
@@ -183,6 +184,8 @@ class Plan:
         self.loaders = {}       # module -> tests that load it
         self.python = []        # (path, sites, function spans) of changed python files
         self.plain = True       # every candidate comes from located python changes
+        self.fixture = {}       # changed fixture file -> tests reading it
+        self.other_mask = 0     # candidates from anything but a changed fixture file
 
 
 def module_name(path):
@@ -307,6 +310,11 @@ def query_mask(maps, plan, method):
 
 
 def analyze(maps, patch_bytes, repo):
+    plan = _analyze(maps, patch_bytes, repo)
+    return plan
+
+
+def _analyze(maps, patch_bytes, repo):
     plan = Plan()
     try:
         file_patches = patchlib.parse(patch_bytes)
@@ -319,6 +327,25 @@ def analyze(maps, patch_bytes, repo):
         plan.notes.append("no file patches found")
         return plan
     for fp in file_patches:
+        before = plan.cands
+        plan.cands = 0
+        _one_file(maps, plan, fp, repo)
+        path = fp.new or fp.old
+        simple_fixture = (
+            path.startswith("tests/fixtures/")
+            and not (fp.binary or fp.created or fp.deleted or fp.renamed)
+            and path in plan.files
+        )
+        if simple_fixture:
+            plan.fixture[path] = plan.fixture.get(path, 0) | plan.cands
+        else:
+            plan.other_mask |= plan.cands
+        plan.cands |= before
+    return plan
+
+
+def _one_file(maps, plan, fp, repo):
+    if True:
         path = fp.new or fp.old
         plan.touched.add(path)
         if fp.old and fp.old != path:
@@ -329,9 +356,9 @@ def analyze(maps, patch_bytes, repo):
         if fp.renamed or (fp.old and fp.new and fp.old != fp.new):
             plan.blind_all = True
             plan.notes.append("%s: renamed" % path)
-            continue
+            return
         if fp.mode_only and not fp.hunks and not fp.binary:
-            continue
+            return
         if base in CONFIG_FILES or (is_py and "/" not in path):
             # test configuration, or a new top-level module that could shadow another
             if base in ("pyproject.toml", "setup.cfg") and not any(
@@ -346,7 +373,7 @@ def analyze(maps, patch_bytes, repo):
             else:
                 plan.blind_all = True
                 plan.notes.append("%s: configuration" % path)
-                continue
+                return
         if fp.binary:
             plan.plain = False
             mask = maps.opened.get(path, 0)
@@ -357,7 +384,7 @@ def analyze(maps, patch_bytes, repo):
             plan.cands |= mask
             plan.blind |= mask
             plan.notes.append("%s: binary change" % path)
-            continue
+            return
         old = None
         if not fp.created:
             try:
@@ -366,7 +393,7 @@ def analyze(maps, patch_bytes, repo):
             except OSError:
                 plan.blind_all = True
                 plan.notes.append("%s: not in the pinned tree" % path)
-                continue
+                return
         if fp.deleted:
             plan.files[path] = None
             plan.plain = False
@@ -379,13 +406,13 @@ def analyze(maps, patch_bytes, repo):
                 mask |= maps.by_file.get("tests/test_sqlglotc.py", 0)
             plan.cands |= mask
             plan.notes.append("%s: deleted" % path)
-            continue
+            return
         try:
             new = patchlib.apply(old or b"", fp)
         except Exception:
             plan.blind_all = True
             plan.notes.append("%s: patch does not apply" % path)
-            continue
+            return
         plan.files[path] = new
         if fp.created:
             plan.plain = False
@@ -401,9 +428,9 @@ def analyze(maps, patch_bytes, repo):
                 if path.startswith("sqlglotc/"):
                     plan.cands |= maps.by_file.get("tests/test_sqlglotc.py", 0)
                 plan.notes.append("%s: new file" % path)
-            continue
+            return
         if new == old:
-            continue
+            return
         if is_py and in_code:
             _python_file(maps, plan, path, old, new)
         else:
@@ -414,4 +441,3 @@ def analyze(maps, patch_bytes, repo):
                 plan.plain = False
             plan.cands |= mask
             plan.notes.append("%s: data file read by %d tests" % (path, bin(mask).count("1")))
-    return plan

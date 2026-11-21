@@ -112,6 +112,7 @@ def main(out):
 
     try:
         maps = analyze.Maps(MAPS)
+        runner.PINNED_FIXTURES = os.path.join(REPO, "tests", "fixtures")
         # CPU seconds a test is expected to take here: measured alone at the pinned
         # commit (minus process start-up), else its recorded time
         estimate = dict(seconds)
@@ -160,6 +161,37 @@ def main(out):
             light = sorted(cands - heavy - plan.blind_numbers)
             plan.light = light
             plan.smoke = {}
+            # Tests that are candidates only because their fixture file changed
+            # need to see just the entries that differ from the pinned file.
+            thin = {}
+            cost_of = estimate
+            if plan.fixture and "tests/helpers.py" not in plan.touched:
+                cost_of = dict(estimate)
+                for path, mask in plan.fixture.items():
+                    name = path[len("tests/fixtures/"):]
+                    for i in bits(mask & ~plan.other_mask):
+                        test_id = maps.ids[i]
+                        if test_id in maps.thinnable and test_id in number_of:
+                            thin.setdefault(test_id, ("changed", set()))[1].add(name)
+                            cost_of[number_of[test_id]] = min(estimate[number_of[test_id]], 0.05)
+            # Code changes: fixture-driven tests need only the entries that reach them.
+            if plan.plain and plan.python:
+                for n in light:
+                    test_id = id_of[n]
+                    entry = maps.queries.get(test_id)
+                    if entry is None or test_id in tpc.TARGETS or test_id not in maps.thinnable:
+                        continue
+                    mask = analyze.query_mask(maps, plan, test_id)
+                    if mask is None:
+                        continue
+                    view, entry_cpu, base_cpu = entry
+                    positions = bits(mask)
+                    if len(positions) >= view.size:
+                        continue
+                    if cost_of is estimate:
+                        cost_of = dict(estimate)
+                    thin[test_id] = ("keep", set(positions))
+                    cost_of[n] = min(estimate[n], base_cpu + sum(entry_cpu[k] for k in positions))
             # Running the cheap candidates costs their CPU time; selecting all of
             # them unseen costs worker time.  Take the cheaper road.
             # Running leaves nothing to select about half the time, and usually a
@@ -187,7 +219,7 @@ def main(out):
                     spent_exact += plan.query[n][2]
             unsettled = executor_heavy - settled
             blind_cost = pack_cost(set(light) | unsettled | plan.blind_numbers, millis) / 1000.0
-            cpu_cost = 0.08 + sum(estimate[n] for n in light)
+            cpu_cost = 0.08 + sum(cost_of[n] for n in light)
             cpu_cost += sum(maps.class_setup.get(c, 0.05) for c in {id_of[n].rsplit("::", 1)[0] for n in light})
             run_cost = cpu_cost + FAIL_ODDS * (2.0 + FAIL_SHARE * max(blind_cost - 2.0, 0.0))
             plan.ran_light = True
@@ -238,7 +270,7 @@ def main(out):
             for n, _entry in query_entries:
                 budgets[n] = query_budget[n]
             short = not ({"tests/test_executor.py", "tests/helpers.py"} & plan.touched)
-            job = runner.Job(commit, root, entries, budgets, short_tables=short)
+            job = runner.Job(commit, root, entries, budgets, short_tables=short, thin=thin)
             job.estimate = cpu_cost
             jobs.append(job)
             job_of[commit] = job

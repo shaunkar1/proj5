@@ -133,17 +133,16 @@ def machine_speed():
         sorted(table.values(), key=lambda entry: entry[1])
         return time.process_time() - started
 
-    best = min(spin() for _ in range(3))
-    return min(max(best / SPIN_SECONDS, 0.8), 2.5)
+    best = min(spin() for _ in range(5))
+    # in quarter steps, so that timing noise does not move decisions between runs
+    return min(max(round(4.0 * best / SPIN_SECONDS) / 4.0, 0.75), 2.5)
 
 
 def main(out):
     global SPEED, SLACK
     SPEED = machine_speed()
     SLACK = max(1.0, SPEED)  # wall-clock allowances stretch on a slower machine, never shrink
-    import gc
-
-    gc.disable()  # short-lived, and syntax trees are all cycles: collecting them is wasted work
+    log("machine speed factor %.2f" % SPEED)
     import analyze
     import overlay
     import proxies

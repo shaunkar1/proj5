@@ -148,7 +148,7 @@ def main(out):
             plan.proxy = {}
             for n in cands:
                 test_id = id_of[n]
-                if test_id in EXECUTOR_HEAVY:
+                if test_id in tpc.TARGETS:
                     heavy.add(n)
                 elif test_id in proxies.PROXIES and n not in blind:
                     if test_id.split("::", 1)[0] in plan.touched:
@@ -168,10 +168,10 @@ def main(out):
             # The long TPC tests: which of their queries can see the patch, and
             # can those be run outright for a firm answer?
             plan.query = {}
-            stable = not any(p.startswith(tpc.UNSTABLE) for p in plan.touched)
             for n in sorted(executor_heavy):
-                method = tpc.IDS[id_of[n]]
+                method = id_of[n]
                 entry = maps.queries.get(method)
+                stable = not any(p.startswith(tpc.UNSTABLE[method]) for p in plan.touched)
                 if entry is None or not stable or n in plan.blind_numbers:
                     continue
                 view, query_cpu, base_cpu = entry
@@ -218,7 +218,7 @@ def main(out):
                     plan.exact[n] = False
                     if not chosen:
                         continue
-                query_entries.append((n, runner.PROXY + "query:%s:%s" % (method, ",".join(map(str, sorted(chosen))))))
+                query_entries.append((n, runner.PROXY + "query:%s|%s" % (method, ",".join(map(str, sorted(chosen))))))
                 query_budget[n] = 30.0 + 6.0 * total
             entries = [(n, id_of[n]) for n in light]
             entries += [(n, runner.PROXY + test_id) for n, test_id in sorted(plan.proxy.items())]

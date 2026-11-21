@@ -12,9 +12,12 @@ import coverage, unittest, unittest.mock, duckdb, numpy, pandas, pandas.testing 
 os.chdir(ROOT); sys.path.insert(0, ROOT); os.environ["SKIP_INTEGRATION"] = "0"
 inlinepool.install()
 import importlib
-module = importlib.import_module(tpc.MODULE)
-counts = {"tpcds_sqls": len(list(module.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))),
-          "tpch_sqls": len(list(module.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql")))}
+ONLY = os.environ.get("ONLY")
+targets = {t: v for t, v in tpc.TARGETS.items() if not ONLY or ONLY in t}
+modules = {v[0]: importlib.import_module(v[0]) for v in targets.values()}
+counts = {t: tpc.size(t, modules[v[0]]) for t, v in targets.items()}
+def key(test_id):
+    return test_id.rsplit("::", 1)[1]
 TMP = OUT + ".parts"
 os.makedirs(TMP, exist_ok=True)
 
@@ -42,8 +45,9 @@ def run_one(method, position, traced):
         mon.set_events(4, mon.events.PY_START)
         cov = coverage.Coverage(data_file=None, source=[os.path.join(ROOT, "sqlglot"), os.path.join(ROOT, "tests")], config_file=False)
         cov.start()
-    tpc.thin(module, {method: {position} if position >= 0 else set()})
-    suite = unittest.TestSuite([getattr(module, tpc.CLASS)(method)])
+    tpc.thin(modules, {method: {position} if position >= 0 else set()})
+    module_name, class_name, test_method = tpc.TARGETS[method][:3]
+    suite = unittest.TestSuite([getattr(modules[module_name], class_name)(test_method)])
     result = unittest.TestResult()
     t0 = time.process_time()
     devnull = os.open(os.devnull, os.O_RDWR); os.dup2(devnull, 1); os.dup2(devnull, 2)
@@ -57,15 +61,15 @@ def run_one(method, position, traced):
         record["lines"] = {os.path.relpath(f, ROOT): sorted(data.lines(f) or []) for f in data.measured_files() if data.lines(f)}
         record["started"] = sorted([os.path.relpath(f, ROOT), l] for f, l in started)
         record["inst"] = sorted(inst)
-    with open(os.path.join(TMP, "%s.%d.%d.json" % (method, position, int(traced))), "w") as f:
+    with open(os.path.join(TMP, "%s.%d.%d.json" % (key(method), position, int(traced))), "w") as f:
         json.dump(record, f)
 
 
 todo = []
-for method, (attr, _schema) in tpc.TESTS.items():
-    for position in range(-1, counts[attr]):
+for method in targets:
+    for position in range(-1, counts[method]):
         for traced in (0, 1):
-            if not os.path.exists(os.path.join(TMP, "%s.%d.%d.json" % (method, position, traced))):
+            if not os.path.exists(os.path.join(TMP, "%s.%d.%d.json" % (key(method), position, traced))):
                 todo.append((method, position, traced))
 active = set()
 t0 = time.time()
@@ -84,15 +88,16 @@ for n, job in enumerate(todo):
 while active:
     pid, _ = os.wait(); active.discard(pid)
 
-out = {}
-for method, (attr, _schema) in tpc.TESTS.items():
-    n = counts[attr]
+out = json.load(open(OUT)) if os.path.exists(OUT) else {}
+out = {t: v for t, v in out.items() if t in tpc.TARGETS}
+for method in targets:
+    n = counts[method]
     lines, started, inst, cpu = {}, {}, {}, []
-    base = json.load(open(os.path.join(TMP, "%s.-1.0.json" % method)))
+    base = json.load(open(os.path.join(TMP, "%s.-1.0.json" % key(method))))
     assert base["ok"], method
     for position in range(n):
-        timed = json.load(open(os.path.join(TMP, "%s.%d.0.json" % (method, position))))
-        traced = json.load(open(os.path.join(TMP, "%s.%d.1.json" % (method, position))))
+        timed = json.load(open(os.path.join(TMP, "%s.%d.0.json" % (key(method), position))))
+        traced = json.load(open(os.path.join(TMP, "%s.%d.1.json" % (key(method), position))))
         assert timed["ok"] and traced["ok"], (method, position)
         cpu.append(round(max(timed["cpu"] - base["cpu"], 0.0), 3))
         bit = 1 << position

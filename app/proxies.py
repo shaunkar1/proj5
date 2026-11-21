@@ -1,13 +1,9 @@
-"""Scaled-down runs of the two slowest single tests.
+"""A scaled-down run of the slowest single test.
 
-test_max_nodes parses a two-million-node query to see the node limit trip, and
-test_generator_memory builds 1100 generators per dialect to look for a leak.
-Both take many seconds.  These run the same checks with smaller sizes against
-the patched tree; when the small run fails, the real test is selected.
+test_max_nodes parses a two-million-node query to see the node limit trip, which
+takes half a minute.  This runs the same checks with smaller sizes against the
+patched tree; when the small run fails, the real test is selected.
 """
-
-import gc
-import tracemalloc
 
 
 def max_nodes():
@@ -44,29 +40,6 @@ def max_nodes():
     assert isinstance(parse_one("SELECT 1, 2, 3"), exp.Select)
 
 
-def generator_memory():
-    from sqlglot.dialects.dialect import Dialect, Dialects
-
-    warm, rounds = 20, 200
-    for name in Dialects:
-        dialect = Dialect.get_or_raise(name)
-        for _ in range(warm):
-            dialect.generator()
-        gc.collect()
-        tracemalloc.start()
-        try:
-            before = tracemalloc.get_traced_memory()[0]
-            for _ in range(rounds):
-                dialect.generator()
-            gc.collect()
-            after = tracemalloc.get_traced_memory()[0]
-        finally:
-            tracemalloc.stop()
-        # the real test allows 1024 bytes over 1000 rounds
-        assert after - before < 1024 * rounds // 1000, (name, after - before)
-
-
 PROXIES = {
     "tests/test_parser.py::TestParser::test_max_nodes": max_nodes,
-    "tests/test_generator.py::TestGenerator::test_generator_memory": generator_memory,
 }

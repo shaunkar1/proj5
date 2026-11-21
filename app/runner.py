@@ -188,20 +188,22 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False):
     query_runs = [(index, test_id[len("query:"):]) for index, test_id in stand_ins if test_id.startswith("query:")]
     stand_ins = [(index, test_id) for index, test_id in stand_ins if not test_id.startswith("query:")]
     if query_runs:
-        # the long TPC tests, thinned to the queries the patch can reach
+        # looping tests, thinned to the part the patch can reach: "<test id>|<positions>"
         try:
             import tpc
 
-            module = importlib.import_module(tpc.MODULE)
-            selection = {}
+            selection, modules = {}, {}
+            for index, spec in query_runs:
+                test_id, _, positions = spec.rpartition("|")
+                selection[test_id] = {int(p) for p in positions.split(",") if p}
+                modules[tpc.TARGETS[test_id][0]] = importlib.import_module(tpc.TARGETS[test_id][0])
+            tpc.thin(modules, selection)
             cases = unittest.TestSuite()
             case_index = {}
             for index, spec in query_runs:
-                method, _, positions = spec.partition(":")
-                selection[method] = {int(p) for p in positions.split(",") if p}
-            tpc.thin(module, selection)
-            for index, spec in query_runs:
-                case = getattr(module, tpc.CLASS)(spec.partition(":")[0])
+                test_id = spec.rpartition("|")[0]
+                module_name, class_name, method = tpc.TARGETS[test_id][:3]
+                case = getattr(modules[module_name], class_name)(method)
                 case_index[case.id()] = index
                 cases.addTest(case)
             cases.run(_Result(emit, case_index))

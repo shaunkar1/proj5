@@ -37,7 +37,7 @@ EXECUTOR_HEAVY = (
 )
 EXECUTOR_PATHS = ("tests/test_executor.py", "tests/fixtures/optimizer/tpc-")
 MIN_EVIDENCE = 3
-EXACT_BUDGET = 10.0        # CPU seconds worth spending to settle a long TPC test outright
+EXACT_BUDGET = 12.0        # CPU seconds worth spending to settle a long TPC test outright
 PROBE_BUDGET = 0.0         # no partial looks: a partial pass proves nothing
 FAIL_ODDS = 0.5            # chance that a reachable change breaks at least one test
 FAIL_SHARE = 0.3           # share of the candidates' worker time the failing ones need
@@ -150,6 +150,9 @@ def main(out):
             for n in cands:
                 test_id = id_of[n]
                 if test_id in tpc.TARGETS:
+                    usable = test_id in maps.queries and not any(p.startswith(tpc.UNSTABLE[test_id]) for p in plan.touched)
+                    if test_id == tpc.GENERATOR_MEMORY and not usable:
+                        continue  # cheap enough to simply run in full with the rest
                     heavy.add(n)
                 elif test_id in proxies.PROXIES and n not in blind:
                     if test_id.split("::", 1)[0] in plan.touched:

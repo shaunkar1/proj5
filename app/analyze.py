@@ -40,11 +40,16 @@ CONFIG_FILES = ("pytest.ini", "tox.ini", "conftest.py", "pyproject.toml", "setup
 class View:
     """What each member of a population (tests, or queries of one test) reaches."""
 
-    def __init__(self, size, files, inst, refs):
+    def __init__(self, size, files, inst, refs, late_files=None, inst_early=None):
         self.size = size
         self.all = (1 << size) - 1
         self._files = files      # path -> packed ((sets, lines), (sets, firsts)) or its zlib pickle
         self._cache = {}
+        # lines run after the member's modules were imported, and classes
+        # instantiated before that; None when the records make no such split
+        self._late = late_files
+        self._late_cache = {}
+        self.inst_early = inst_early or {}
         self.inst = inst         # class -> mask
         self.refs = refs         # name -> (reader statements, derived names, read at import) or None
 
@@ -61,6 +66,23 @@ class View:
 
     def covering(self, path, lo, hi):
         (sets, lines), _ = self.file(path)
+        mask = 0
+        seen = set()
+        for line in range(lo, hi + 1):
+            k = lines.get(line)
+            if k is not None and k not in seen:
+                seen.add(k)
+                mask |= sets[k]
+        return mask
+
+    def covering_late(self, path, lo, hi):
+        """Like covering, but counting only what ran after import time."""
+        if self._late is None:
+            return self.covering(path, lo, hi)
+        if path not in self._late_cache:
+            blob = self._late.get(path)
+            self._late_cache[path] = pickle.loads(zlib.decompress(blob)) if blob is not None else ([], {})
+        sets, lines = self._late_cache[path]
         mask = 0
         seen = set()
         for line in range(lo, hi + 1):
@@ -92,11 +114,15 @@ class View:
                 mask |= sets[k]
         return mask
 
-    def readers(self, names, allow_import_time):
+    def readers(self, names, allow_import_time, early_holders=None):
         """Members executing a statement that reads one of these names, following
         names derived from them; None when that cannot be told.  With
         allow_import_time False, a name read by a function that also runs while
-        modules are imported counts as untraceable."""
+        modules are imported counts as untraceable.
+
+        early_holders: when given, the name belongs to a class, and a read made
+        while modules are imported only counts for members that already held an
+        instance of that class then (the bit mask given)."""
         todo = list(names)
         seen = set()
         mask = 0
@@ -112,7 +138,10 @@ class View:
             if at_import and not allow_import_time:
                 return None
             for path, first, lo, hi in statements:
-                reached = self.covering(path, lo, hi)
+                if early_holders is None:
+                    reached = self.covering(path, lo, hi)
+                else:
+                    reached = self.covering_late(path, lo, hi) | (self.covering(path, lo, hi) & early_holders)
                 entered = self.entering(path, first)
                 if entered is not None:
                     reached &= entered
@@ -139,7 +168,7 @@ class Maps:
         self.thinnable = set(data.get("thinnable", ()))
         self.holders = data.get("holders", {})
         refs = data.get("refs", {})
-        self.view = View(len(self.ids), data["files"], data["inst"], refs)
+        self.view = View(len(self.ids), data["files"], data["inst"], refs, data.get("late_files"), data.get("inst_early"))
         self.all = self.view.all
         # per-query views of the long TPC tests: method -> (View, cpu seconds per query, fixed cpu)
         self.queries = {}
@@ -233,13 +262,15 @@ def site_mask(maps, view, path, site, function_spans, loaders, notes=None):
                 mask = loaders
         elif _is_instance_class(maps, key):
             mask = view.inst.get(key, 0) | methods
+            early = view.inst_early.get(key, 0)
             # a dialect reads settings of its tokenizer, parser and generator
             # classes without making instances of them
             for holder in maps.holders.get(key, ()):
                 mask |= view.inst.get(holder, 0)
+                early |= view.inst_early.get(holder, 0)
             # Instances made while modules are imported could carry the old
             # value into import-time state; then nothing can be narrowed.
-            reading = view.readers(targets, True) if targets and (FOLLOW_ALL or key not in maps.at_import) else None
+            reading = view.readers(targets, True, early) if targets and (FOLLOW_ALL or key not in maps.at_import) else None
             if reading is not None:
                 mask &= reading
         else:

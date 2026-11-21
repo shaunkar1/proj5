@@ -37,7 +37,8 @@ EXECUTOR_HEAVY = (
 EXECUTOR_PATHS = ("tests/test_executor.py", "tests/fixtures/optimizer/tpc-")
 MIN_EVIDENCE = 3
 EXACT_BUDGET = 12.0        # CPU seconds worth spending to settle a long TPC test outright
-PROBE_BUDGET = 0.0         # no partial looks: a partial pass proves nothing
+PROBE_QUERIES = 10         # executing queries to try when a long TPC test cannot be settled
+STRONG_EVIDENCE = 4        # this many cheaper failures select it even after a clean probe
 FAIL_ODDS = 0.5            # chance that a reachable change breaks at least one test
 FAIL_SHARE = 0.3           # share of the candidates' worker time the failing ones need
 
@@ -248,17 +249,32 @@ def main(out):
                     settled.add(n)
                     spent_exact += plan.query[n][2]
             unsettled = executor_heavy - settled
-            blind_cost = pack_cost(set(light) | unsettled | plan.blind_numbers, millis) / 1000.0
+            # A test that cannot be settled is probed: every reaching query that
+            # only gets parsed, plus the cheapest few that execute.  A patch that
+            # breaks such a test nearly always breaks most of its queries.
+            plan.probe = {}
+            for n in sorted(unsettled):
+                if n not in plan.query:
+                    continue
+                method, positions, _total = plan.query[n]
+                view = maps.queries[method][0]
+                executing = view.inst.get("sqlglot.executor.python:PythonExecutor", 0)
+                parsed_only = [k for k in positions if not (executing >> k) & 1]
+                executed = [k for k in positions if (executing >> k) & 1][:PROBE_QUERIES]
+                if executed or parsed_only:
+                    plan.probe[n] = parsed_only + executed
+            unprobed = unsettled - set(plan.probe)
+            blind_cost = pack_cost(set(light) | unprobed | plan.blind_numbers, millis) / 1000.0
             cpu_cost = 0.08 + sum(cost_of[n] for n in light)
             cpu_cost += sum(maps.class_setup.get(c, 0.05) for c in {id_of[n].rsplit("::", 1)[0] for n in light})
             run_cost = cpu_cost + FAIL_ODDS * (2.0 + FAIL_SHARE * max(blind_cost - 2.0, 0.0))
             plan.ran_light = True
             if light and run_cost > blind_cost:
-                log(commit, "cheaper to select %d candidates unseen (%.1f s) than to run them (%.1f s)" % (len(light) + len(unsettled), blind_cost, run_cost))
+                log(commit, "cheaper to select %d candidates unseen (%.1f s) than to run them (%.1f s)" % (len(light) + len(unprobed), blind_cost, run_cost))
                 plan.blind_numbers.update(light)
-                plan.blind_numbers.update(unsettled)
+                plan.blind_numbers.update(unprobed)
                 plan.light = light = []
-                plan.heavy = set(plan.proxy) | settled
+                plan.heavy = set(plan.proxy) | settled | set(plan.probe)
                 plan.ran_light = False
             # queries to run: all that can see the patch when that settles the
             # test, otherwise the cheapest few as a safety net for the rule below
@@ -270,16 +286,11 @@ def main(out):
                 if n in settled:
                     chosen = positions
                     plan.exact[n] = True
-                else:
-                    chosen, spent = [], 0.0
-                    for k in positions:
-                        if spent + query_cpu_of(maps, method, k) > PROBE_BUDGET:
-                            break
-                        chosen.append(k)
-                        spent += query_cpu_of(maps, method, k)
+                elif n in plan.probe:
+                    chosen = plan.probe[n]
                     plan.exact[n] = False
-                    if not chosen:
-                        continue
+                else:
+                    continue
                 query_entries.append((n, runner.PROXY + "query:%s|%s" % (method, ",".join(map(str, sorted(chosen))))))
                 query_budget[n] = 30.0 + 6.0 * total
             entries = [(n, id_of[n]) for n in light]
@@ -357,12 +368,22 @@ def main(out):
                 or len(plan.light) < MIN_EVIDENCE
                 or any(p.startswith(EXECUTOR_PATHS) for p in plan.touched)
             )
+            strong = (
+                len(light_failed) >= STRONG_EVIDENCE
+                or unfinished
+                or any(p.startswith(EXECUTOR_PATHS) for p in plan.touched)
+            )
             for n in plan.heavy:
                 if n in plan.proxy or n in selected:
                     continue
-                if getattr(plan, "exact", {}).get(n):
+                exact = getattr(plan, "exact", {}).get(n)
+                if exact:
                     continue  # ran in full and passed (a failure is already selected)
-                if evidence:
+                if exact is False:
+                    # probed and clean: left out unless many cheaper tests fail
+                    if strong:
+                        selected.add(n)
+                elif evidence:
                     selected.add(n)
             if VERBOSE:
                 log(commit, "cands=%d ran=%d failed=%d selected=%d cpu=%.2f rec=%.2f" % (len(plan.numbers), len(plan.light), len(light_failed), len(selected), job.cpu if job else 0, sum(seconds[n] for n in plan.light)), "|", "; ".join(plan.notes))

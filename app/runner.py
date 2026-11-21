@@ -136,7 +136,7 @@ def _limit_duckdb_threads():
     duckdb.connect = connect
 
 
-def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None):
+def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None, before_run=None):
     """Runs in the forked child.  `tests` is a list of (index, test_id)."""
     for fd in CLOSE_IN_CHILD:
         try:
@@ -202,6 +202,8 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None
             thin_by_case[case.id()] = thin[test_id]
         suite.addTest(case)
     result = _Result(emit, index_of, thin_by_case)
+    if before_run is not None:
+        before_run()
     try:
         suite.run(result)
     except BaseException:

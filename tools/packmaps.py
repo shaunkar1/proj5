@@ -10,6 +10,8 @@ n = max(records) + 1
 assert len(records) == n, (len(records), n)
 ids = [records[i]["id"] for i in range(n)]
 
+late = {}        # file -> line -> mask, lines run after the test's modules were imported
+inst_early = {}  # class -> mask, instances made while the test's modules were imported
 lines = {}    # file -> line -> mask
 started = {}  # file -> first line -> mask
 opened = {}   # file -> mask
@@ -26,6 +28,12 @@ for i in range(n):
         anyline[f] = anyline.get(f, 0) | bit
         for l in ls:
             d[l] = d.get(l, 0) | bit
+    for f, ls in r.get("late", {}).items():
+        d = late.setdefault(f, {})
+        for l in ls:
+            d[l] = d.get(l, 0) | bit
+    for c in r.get("inst_early", ()):
+        inst_early[c] = inst_early.get(c, 0) | bit
     for f, l in r["started"]:
         d = started.setdefault(f, {})
         d[l] = d.get(l, 0) | bit
@@ -46,6 +54,8 @@ def pack(d):
 files = {}
 for f in set(lines) | set(started):
     files[f] = zlib.compress(pickle.dumps((pack(lines.get(f, {})), pack(started.get(f, {}))), protocol=5), 6)
+
+late_files = {f: zlib.compress(pickle.dumps(pack(d), protocol=5), 6) for f, d in late.items()}
 
 ip = json.load(open(IMPORTPASS))
 
@@ -170,6 +180,8 @@ thinnable = json.load(open(sys.argv[7])) if len(sys.argv) > 7 else []
 
 index = {
     "thinnable": thinnable,
+    "late_files": late_files,
+    "inst_early": inst_early,
     "queries": queries,
     "refs": refs,
     "instantiated_at_import": ip["instantiated"],

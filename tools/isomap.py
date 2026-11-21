@@ -17,6 +17,8 @@ tests = json.load(open(TESTS))["tests"]
 def child(index, test_id):
     opened = set()
     inst = set()
+    inst_early = set()  # made while the test's modules were being imported
+    phase = ["A"]
     _open = builtins.open
 
     def traced_open(file, *a, **k):
@@ -44,10 +46,11 @@ def child(index, test_id):
             return mon.DISABLE
         try:
             t = type(sys._getframe(1).f_locals.get(code.co_varnames[0]))
-            if t not in inst:
+            bucket = inst if phase[0] == "B" else inst_early
+            if t not in bucket:
                 for k in t.__mro__:
                     if k.__module__.startswith(("sqlglot", "tests")):
-                        inst.add(k)
+                        bucket.add(k)
         except Exception:
             pass
 
@@ -55,9 +58,15 @@ def child(index, test_id):
     mon.set_events(4, mon.events.PY_START)
     cov = coverage.Coverage(data_file=None, source=[os.path.join(ROOT, "sqlglot"), os.path.join(ROOT, "tests")], config_file=False)
     cov.start()
+    cov.switch_context("A")
+
+    def test_phase():
+        phase[0] = "B"
+        cov.switch_context("B")
+
     rfd, wfd = os.pipe()
     t0 = time.process_time()
-    runner.child_main(ROOT, [(index, test_id)], wfd)
+    runner.child_main(ROOT, [(index, test_id)], wfd, before_run=test_phase)
     cpu = time.process_time() - t0
     cov.stop()
     mon.set_events(4, 0)
@@ -66,9 +75,13 @@ def child(index, test_id):
     data = cov.get_data()
     lines = {os.path.relpath(f, ROOT): sorted(data.lines(f) or []) for f in data.measured_files()}
     lines = {f: l for f, l in lines.items() if l}
+    data.set_query_context("B")
+    late = {os.path.relpath(f, ROOT): sorted(data.lines(f) or []) for f in data.measured_files()}
+    late = {f: l for f, l in late.items() if l}
     with _open(os.path.join(OUT, "%d.json" % index), "w") as f:
-        json.dump({"id": test_id, "status": status, "cpu": round(cpu, 3), "lines": lines, "opened": sorted(opened), "started": sorted([os.path.relpath(f, ROOT), l] for f, l in started),
-                   "inst": sorted(c.__module__ + ":" + c.__qualname__ for c in inst)}, f)
+        json.dump({"id": test_id, "status": status, "cpu": round(cpu, 3), "lines": lines, "late": late,
+                   "inst_early": sorted(c.__module__ + ":" + c.__qualname__ for c in inst_early), "opened": sorted(opened), "started": sorted([os.path.relpath(f, ROOT), l] for f, l in started),
+                   "inst": sorted(c.__module__ + ":" + c.__qualname__ for c in inst | inst_early)}, f)
 
 
 todo = [(t["number"], t["id"]) for t in tests if not os.path.exists(os.path.join(OUT, "%d.json" % t["number"]))]

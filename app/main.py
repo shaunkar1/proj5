@@ -100,6 +100,9 @@ def main(out):
     with open(os.path.join(DATA, "tests.json")) as handle:
         tests = json.load(handle)["tests"]
     number_of = {t["id"]: t["number"] for t in tests}
+    import astdiff
+
+    astdiff.DOCS_MATTER = any("test_docs" in t["id"] or "doctest" in t["id"].lower() for t in tests)
     id_of = {t["number"]: t["id"] for t in tests}
     millis = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     seconds = {t["number"]: t["seconds"] for t in tests}

@@ -167,6 +167,23 @@ def _walk(a, b, path, out):
             out.append(_site(path + [(a, field)], False))
 
 
+DOCS_MATTER = False  # set when the test list holds tests that read docstrings
+
+_DOCUMENTED = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _drop_docstrings(tree):
+    for node in ast.walk(tree):
+        if not isinstance(node, _DOCUMENTED) or not node.body:
+            continue
+        first = node.body[0]
+        if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
+            if len(node.body) > 1:
+                del node.body[0]
+            else:
+                node.body[0] = ast.copy_location(ast.Pass(), first)
+
+
 def diff(old_source, new_source):
     """Sites where the two sources differ.  Raises SyntaxError when the new
     source does not parse (ValueError for null bytes is turned into one)."""
@@ -175,6 +192,12 @@ def diff(old_source, new_source):
         new_tree = ast.parse(new_source)
     except ValueError as error:
         raise SyntaxError(str(error))
+
+    # Nothing in the listed tests reads a docstring (the doctest loader is not
+    # among them), so documentation text is not part of the program compared.
+    if not DOCS_MATTER:
+        for tree in (old_tree, new_tree):
+            _drop_docstrings(tree)
 
     def lines_of(source):
         if isinstance(source, bytes):

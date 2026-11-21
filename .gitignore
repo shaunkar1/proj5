@@ -3,3 +3,4 @@ output.jsonl
 sample/
 score.py
 *.tar.gz
+cache/

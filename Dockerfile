@@ -16,6 +16,12 @@ COPY build/fetch_sqlglot.py /app/build/fetch_sqlglot.py
 RUN python /app/build/fetch_sqlglot.py /app/repo \
  && python -m compileall -q --invalidation-mode checked-hash /app/repo/sqlglot /app/repo/tests
 
+# What DuckDB answers for the TPC queries at the pinned commit (the reference
+# side of sqlglot's executor tests), recorded once here instead of on every run.
+# A run works without the file; it is only slower.
+COPY build/duckcache.py /app/build/duckcache.py
+RUN PYTHONDONTWRITEBYTECODE=1 python /app/build/duckcache.py /app/repo /app/cache/duck.bin || echo "no DuckDB answer cache"
+
 COPY app /app/app
 COPY maps /app/maps
 RUN python -m compileall -q --invalidation-mode checked-hash /app/app && chmod -R a+rX /app

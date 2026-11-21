@@ -136,7 +136,7 @@ def _limit_duckdb_threads():
     duckdb.connect = connect
 
 
-def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None, before_run=None):
+def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None, before_run=None, duck=None):
     """Runs in the forked child.  `tests` is a list of (index, test_id)."""
     for fd in CLOSE_IN_CHILD:
         try:
@@ -224,11 +224,25 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None
         if thin and test_id in thin:
             thin_by_case[case.id()] = thin[test_id]
         suite.addTest(case)
+    if duck and "tests.test_executor" in sys.modules:
+        try:
+            import duckmemo
+
+            duckmemo.install(sys.modules["tests.test_executor"], duck)
+        except BaseException:
+            pass
     result = _Result(emit, index_of, thin_by_case)
     if before_run is not None:
         before_run()
     try:
-        suite.run(result)
+        if os.environ.get("BR_PROFILE"):
+            import cProfile
+
+            profile = cProfile.Profile()
+            profile.runcall(suite.run, result)
+            profile.dump_stats(os.environ["BR_PROFILE"])
+        else:
+            suite.run(result)
     except BaseException:
         pass
     stand_ins = [(index, test_id) for index, test_id in stand_ins if not test_id.startswith("query:")]
@@ -251,7 +265,8 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None
 class Job:
     """One child process working through a list of tests."""
 
-    def __init__(self, key, root, tests, budgets, extra_setup=None, short_tables=False, thin=None):
+    def __init__(self, key, root, tests, budgets, extra_setup=None, short_tables=False, thin=None, duck=None):
+        self.duck = duck
         self.short_tables = short_tables
         self.thin = thin
         self.key = key
@@ -281,7 +296,7 @@ class Job:
             try:
                 os.close(rfd)
                 os.setpgid(0, 0)
-                child_main(self.root, self.pending, wfd, self.extra_setup, self.short_tables, self.thin)
+                child_main(self.root, self.pending, wfd, self.extra_setup, self.short_tables, self.thin, duck=self.duck)
             except BaseException:
                 pass
             finally:

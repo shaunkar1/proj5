@@ -22,6 +22,7 @@ DATA = os.environ.get("BR_DATA", "/data")
 REPO = os.environ.get("BR_REPO", "/app/repo")
 MAPS = os.environ.get("BR_MAPS", os.path.join(HERE, "..", "maps", "map.bin"))
 TMP = os.environ.get("BR_TMP", "/tmp")
+DUCK = os.environ.get("BR_DUCK", os.path.join(HERE, "..", "cache", "duck.bin"))
 VERBOSE = os.environ.get("BR_VERBOSE") == "1"
 PARALLEL = int(os.environ.get("BR_PARALLEL") or 2)
 
@@ -37,6 +38,7 @@ EXECUTOR_HEAVY = (
 )
 EXECUTOR_PATHS = ("tests/test_executor.py", "tests/fixtures/optimizer/tpc-")
 MIN_EVIDENCE = 3
+EXACT_BUDGET_FAST = 5.0    # the same, when DuckDB's answers are on record (costs are then measured in-suite)
 EXACT_BUDGET = 12.0        # CPU seconds worth spending to settle a long TPC test outright
 PROBE_QUERIES = 10         # executing queries to try when a long TPC test cannot be settled
 SETTLE_ODDS = 0.6          # chance that a long test reached by a change still passes
@@ -118,6 +120,18 @@ def main(out):
     try:
         maps = analyze.Maps(MAPS)
         runner.PINNED_FIXTURES = os.path.join(REPO, "tests", "fixtures")
+        # per-query costs of the long TPC tests when DuckDB's answers are on record
+        fast_queries = {}
+        if os.path.exists(DUCK):
+            try:
+                with open(os.path.join(os.path.dirname(MAPS), "fastcpu.json")) as handle:
+                    fast = json.load(handle)
+                fast_queries = dict(maps.queries)
+                for method, sub in fast.items():
+                    if method in maps.queries and len(sub["cpu"]) == maps.queries[method][0].size:
+                        fast_queries[method] = (maps.queries[method][0], sub["cpu"], sub["base_cpu"])
+            except Exception:
+                fast_queries = {}
         # CPU seconds a test is expected to take here: measured alone at the pinned
         # commit (minus process start-up), else its recorded time
         estimate = dict(seconds)
@@ -139,6 +153,7 @@ def main(out):
         job_of = {}
         preload = set()
         for commit in commits:
+            duck_ok = False
             try:
                 with open(os.path.join(DATA, "commits", commit + ".patch"), "rb") as handle:
                     plan = analyze.analyze(maps, handle.read(), REPO)
@@ -212,13 +227,18 @@ def main(out):
             # Running leaves nothing to select about half the time, and usually a
             # small part of the candidates otherwise.
             executor_heavy = {n for n in heavy if n not in plan.proxy}
+            # DuckDB's answers for the TPC queries are on record when the patch
+            # leaves tests and fixtures alone; the long tests then cost far less
+            duck_ok = bool(fast_queries) and all(p.startswith("sqlglot/") and p.endswith(".py") for p in plan.touched)
+            Q = fast_queries if duck_ok else maps.queries
+            exact_budget = EXACT_BUDGET_FAST if duck_ok else EXACT_BUDGET
             # The long TPC tests: which of their queries can see the patch, and
             # can those be run outright for a firm answer?
             plan.query = {}
             plan.untouched = set()
             for n in sorted(executor_heavy):
                 method = id_of[n]
-                entry = maps.queries.get(method)
+                entry = Q.get(method)
                 if entry is None or n in plan.blind_numbers:
                     continue
                 view, query_cpu, base_cpu = entry
@@ -259,7 +279,7 @@ def main(out):
             heavy -= plan.untouched
             settled, spent_exact = set(), 0.0
             for n in sorted(plan.query, key=lambda n: plan.query[n][2]):
-                if spent_exact + plan.query[n][2] <= EXACT_BUDGET:
+                if spent_exact + plan.query[n][2] <= exact_budget:
                     settled.add(n)
                     spent_exact += plan.query[n][2]
             unsettled = executor_heavy - settled
@@ -271,7 +291,7 @@ def main(out):
                 if n not in plan.query:
                     continue
                 method, positions, _total = plan.query[n]
-                view = maps.queries[method][0]
+                view = Q[method][0]
                 executing = view.inst.get("sqlglot.executor.python:PythonExecutor", 0)
                 parsed_only = [k for k in positions if not (executing >> k) & 1]
                 executed = [k for k in positions if (executing >> k) & 1][:PROBE_QUERIES]
@@ -301,7 +321,7 @@ def main(out):
                         cpu = plan.query[n][2]
                     else:
                         method = plan.query[n][0]
-                        cpu = maps.queries[method][2] + sum(query_cpu_of(maps, method, k) for k in plan.probe[n])
+                        cpu = Q[method][2] + sum(Q[method][1][k] for k in plan.probe[n])
                         cpu += sum(cost_of[w] for w in witnesses) + maps.class_setup.get(tpc.EXECUTOR.rstrip(":"), 0.7)
                     if cpu > SETTLE_ODDS * saving:
                         unseen.add(n)
@@ -329,11 +349,11 @@ def main(out):
                 elif n in plan.probe:
                     chosen = plan.probe[n]
                     plan.exact[n] = False
-                    plan.probe_cpu[n] = maps.queries[method][2] + sum(query_cpu_of(maps, method, k) for k in chosen)
+                    plan.probe_cpu[n] = Q[method][2] + sum(Q[method][1][k] for k in chosen)
                 else:
                     continue
                 query_entries.append((n, runner.PROXY + "query:%s|%s" % (method, ",".join(map(str, sorted(chosen))))))
-                expected = maps.queries[method][2] + sum(query_cpu_of(maps, method, k) for k in chosen)
+                expected = Q[method][2] + sum(Q[method][1][k] for k in chosen)
                 query_budget[n] = max(10.0, 3.0 * expected + 5.0)
             entries = [(n, id_of[n]) for n in light]
             entries += [(n, runner.PROXY + test_id) for n, test_id in sorted(plan.proxy.items())]
@@ -353,7 +373,7 @@ def main(out):
             for n, _entry in query_entries:
                 budgets[n] = query_budget[n]
             short = not ({"tests/test_executor.py", "tests/helpers.py"} & plan.touched)
-            job = runner.Job(commit, root, entries, budgets, short_tables=short, thin=thin)
+            job = runner.Job(commit, root, entries, budgets, short_tables=short, thin=thin, duck=DUCK if duck_ok else None)
             job.estimate = cpu_cost
             jobs.append(job)
             job_of[commit] = job
@@ -440,6 +460,9 @@ def main(out):
                 log(commit, "evidence", json.dumps({"failed_in": where, "mode": "run" if getattr(plan, "ran_light", False) else "blind",
                     "probe": {id_of[n].rsplit("::", 1)[-1]: ("fail" if job is not None and n in job.failed else "pass") for n in getattr(plan, "probe", {})}}))
                 log(commit, "cands=%d ran=%d failed=%d selected=%d cpu=%.2f rec=%.2f" % (len(plan.numbers), len(plan.light), len(light_failed), len(selected), job.cpu if job else 0, sum(seconds[n] for n in plan.light)), "|", "; ".join(plan.notes))
+                if job and os.environ.get("BR_TRACE"):
+                    top = sorted(job.elapsed.items(), key=lambda kv: -kv[1])[:6]
+                    log(commit, "trace: in tests %.2f s of %.2f s cpu;" % (sum(job.elapsed.values()), job.cpu), ", ".join("%s %.2f" % (id_of.get(n, str(n)).split("::")[-1], e) for n, e in top))
             answer(commit, selected)
     except Exception as error:
         import traceback

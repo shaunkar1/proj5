@@ -9,14 +9,26 @@ Entry for the RWX Blast Radius track: given a patch against sqlglot at
    and the lines it executes, the functions it enters, the files it opens and the sqlglot classes it
    instantiates are recorded. A patch is located in the old source by comparing syntax trees
    (`app/astdiff.py`), and the tests whose own execution reaches the changed code become candidates
-   (`app/analyze.py`). A patch that leaves the program unchanged (comments, formatting) has none.
+   (`app/analyze.py`). A patch that leaves the program unchanged (comments, formatting, documentation
+   strings: the doctest loader is not among the listed tests) has none. A changed class-level
+   setting is narrowed to the tests that use the class and reach a statement reading that name.
 2. **Run.** The cheap candidates are run against the patched tree inside the container
    (`app/runner.py`), in a forked child that already has the third-party modules loaded. Only tests
-   that fail are selected. When running would cost more CPU than selecting the candidates unseen,
-   they are selected unseen.
-3. **Slow tests.** The two slowest single tests get a scaled-down run of the same checks
-   (`app/proxies.py`). The long TPC executor tests are never run; they are selected when a cheaper
-   test that reaches the same change fails.
+   that fail are selected; a test that hangs or kills its child counts as failing. When running
+   would cost more CPU than selecting the candidates unseen, they are selected unseen.
+3. **Long tests.** A few tests are one long loop. `test_execute_tpcds`, `test_execute_tpch` and
+   `test_optimized_tpch` go over the TPC queries, `test_generator_memory` over the dialects, and
+   several optimizer tests over the entries of a fixture file. The map also records what each
+   query, dialect or entry reaches on its own, so the real test method is run on just the part a
+   patch can affect (`app/tpc.py`, `app/thinload.py`). When that part is too large to run, the
+   cheapest ten queries are run as a probe and the test is selected if the probe or a cheaper
+   executor test that reaches the change fails. `test_max_nodes` gets a scaled-down run of the same
+   check (`app/proxies.py`), only for patches confined to `sqlglot/`.
+   The executor tests compare sqlglot's engine with DuckDB. DuckDB's side does not depend on
+   sqlglot once the SQL text is fixed, so the image build records its answers for the pinned
+   fixtures (`build/duckcache.py`), keyed by the exact SQL sent; a patched tree that sends the same
+   text gets the recorded answer and any other text goes to DuckDB (`app/duckmemo.py`). This is
+   only used when a patch leaves tests and fixtures alone.
 4. **Pack.** Selected tests go longest-first onto the lightest worker, for the worker count that
    minimises busiest load plus 2 s per worker.
 

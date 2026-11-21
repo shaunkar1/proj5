@@ -111,8 +111,14 @@ def visit(rel, node, func, targets, block):
                 store = isinstance(child.ctx, ast.Store)
             elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
                 name = child.id
-            elif isinstance(child, ast.Constant) and isinstance(child.value, str):
-                name = child.value
+            elif (
+                isinstance(child, ast.Constant)
+                and isinstance(child.value, str)
+                and isinstance(node, ast.Call)
+                and isinstance(node.func, (ast.Name, ast.Attribute))
+                and getattr(node.func, "id", getattr(node.func, "attr", "")) in ("getattr", "hasattr", "setattr", "delattr", "attrgetter")
+            ):
+                name = child.value  # attribute named by a string
             if name in readers:
                 if c_func is not None:
                     entry = statements.setdefault((c_func, id(c_block)), [set(), set()])
@@ -147,7 +153,11 @@ times = timing["tests"]
 
 queries = {}
 if len(sys.argv) > 6:
-    for method, sub in json.load(open(sys.argv[6])).items():
+    merged = {}
+    for part in sys.argv[6].split(","):  # per-query and per-fixture-entry records
+        if os.path.exists(part):
+            merged.update(json.load(open(part)))
+    for method, sub in merged.items():
         sub_files = {}
         for f in set(sub["lines"]) | set(sub["started"]):
             sub_files[f] = (pack({int(l): int(m, 16) for l, m in sub["lines"].get(f, {}).items()}),

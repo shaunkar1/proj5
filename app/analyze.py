@@ -30,6 +30,10 @@ INSTANCE_ROOTS = (
     "sqlglot.tokens:Tokenizer",
 )
 
+# Experimental: also narrow settings of classes that are instantiated while
+# modules are imported, and module-level names read at import time.
+FOLLOW_ALL = os.environ.get("BR_FOLLOW_ALL") == "1"
+
 CONFIG_FILES = ("pytest.ini", "tox.ini", "conftest.py", "pyproject.toml", "setup.cfg", "sitecustomize.py")
 
 
@@ -235,7 +239,7 @@ def site_mask(maps, view, path, site, function_spans, loaders, notes=None):
                 mask |= view.inst.get(holder, 0)
             # Instances made while modules are imported could carry the old
             # value into import-time state; then nothing can be narrowed.
-            reading = view.readers(targets, True) if targets and key not in maps.at_import else None
+            reading = view.readers(targets, True) if targets and (FOLLOW_ALL or key not in maps.at_import) else None
             if reading is not None:
                 mask &= reading
         else:
@@ -244,7 +248,7 @@ def site_mask(maps, view, path, site, function_spans, loaders, notes=None):
     else:
         _, lo, hi, targets = site
         mask = loaders
-        reading = view.readers(targets, False) if targets and not is_test else None
+        reading = view.readers(targets, FOLLOW_ALL) if targets and not is_test else None
         if reading is not None:
             mask &= reading
         what = "module level"

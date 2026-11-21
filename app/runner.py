@@ -32,8 +32,9 @@ def split_id(test_id):
 class _Result(unittest.TestResult):
     """Reports each test's outcome to the parent as it happens."""
 
-    def __init__(self, emit, index_of, thin=None):
+    def __init__(self, emit, index_of, thin=None, seen=None):
         super().__init__()
+        self._seen = seen if seen is not None else {"failed": 0, "executor": False}
         self._thin = thin or {}
         self._timing = bool(os.environ.get("BR_TIMES"))
         self._t0 = 0.0
@@ -70,6 +71,10 @@ class _Result(unittest.TestResult):
             if self._timing:
                 self._emit("T %d %.4f\n" % (self._current, time.process_time() - self._t0))
             self._emit("%s %d\n" % ("F" if self._failed else "P", self._current))
+            if self._failed:
+                self._seen["failed"] += 1
+                if test.id().startswith("tests.test_executor."):
+                    self._seen["executor"] = True
         self._current = None
         if not gc.isenabled():
             now = time.monotonic()
@@ -84,16 +89,27 @@ class _Result(unittest.TestResult):
             # A class or module fixture failed: report it by name.
             self._emit("X %s\n" % (getattr(test, "description", None) or str(test)).replace("\n", " "))
 
+    def _show(self, test, err):
+        path = os.environ.get("BR_SHOWFAIL")
+        if path and err is not None:
+            import traceback
+
+            with open(path, "a") as handle:
+                handle.write("%s\n%s\n" % (test, "".join(traceback.format_exception(*err))[-1500:]))
+
     def addError(self, test, err):
+        self._show(test, err)
         self._bad(test)
 
     def addFailure(self, test, err):
+        self._show(test, err)
         self._bad(test)
 
     def addUnexpectedSuccess(self, test):
         self._bad(test)
 
     def addSubTest(self, test, subtest, err):
+        self._show(subtest, err)
         if err is not None:
             self._bad(test)
 
@@ -197,21 +213,37 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None
     # they join the ordinary tests so that class fixtures are set up once
     query_runs = [(index, spec[len("query:"):]) for index, spec in stand_ins if spec.startswith("query:")]
     thinned = {}
+    seen = {"failed": 0, "executor": False}  # how the tests run so far in this child went
     if query_runs:
         try:
             import tpc
 
-            selection, modules = {}, {}
+            selection, modules, wider = {}, {}, {}
             for index, spec in query_runs:
-                test_id, _, positions = spec.rpartition("|")
-                selection[test_id] = {int(p) for p in positions.split(",") if p}
+                # "<test id>|<positions>" or "<test id>|<positions>|<more positions>":
+                # the second list is run instead when cheaper tests have failed
+                fields = spec.split("|")
+                test_id = fields[0]
+                selection[test_id] = {int(p) for p in fields[1].split(",") if p}
+                if len(fields) > 2:
+                    more = {int(p) for p in fields[2].split(",") if p}
+                    wider[test_id] = (more, lambda: seen["executor"] or seen["failed"] >= 4, lambda index=index: emit("E %d\n" % index))
                 modules[tpc.TARGETS[test_id][0]] = importlib.import_module(tpc.TARGETS[test_id][0])
-            tpc.thin(modules, selection)
+                thinned[index] = test_id
+            tpc.thin(modules, selection, wider)
             if "tests.test_executor" in modules:
                 short_tables = False  # the thinning decides which tables load in full
-            for index, spec in query_runs:
-                thinned[index] = spec.rpartition("|")[0]
-            tests = sorted(tests + [(index, test_id) for index, test_id in thinned.items()], key=lambda entry: (entry[1].split("::")[0], entry[0] if entry[0] >= 0 else 10**9))
+            # the executor's file last and the thinned tests last in it, so that
+            # they start knowing how the cheaper tests went
+            tests = sorted(
+                tests + [(index, test_id) for index, test_id in thinned.items()],
+                key=lambda entry: (
+                    entry[1].split("::")[0] == "tests/test_executor.py",
+                    entry[1].split("::")[0],
+                    entry[0] in thinned,
+                    entry[0] if entry[0] >= 0 else 10**9,
+                ),
+            )
         except BaseException:
             for index, _spec in query_runs:
                 emit("F %d\n" % index)
@@ -243,7 +275,7 @@ def child_main(root, tests, wfd, extra_setup=None, short_tables=False, thin=None
             duckmemo.install(sys.modules["tests.test_executor"], duck)
         except BaseException:
             pass
-    result = _Result(emit, index_of, thin_by_case)
+    result = _Result(emit, index_of, thin_by_case, seen)
     if before_run is not None:
         before_run()
     try:
@@ -303,6 +335,7 @@ class Job:
         self.cpu = 0.0
         self.times = {}
         self.kills = 0
+        self.exact = set()
         self.elapsed = {}  # index -> wall seconds the test took
         self.started_at = 0.0
 
@@ -365,6 +398,8 @@ class Job:
                         if full == target or module_name.replace(".", "/") == target:
                             self.passed.discard(index)
                             self.failed.add(index)
+            elif kind == "E":
+                self.exact.add(int(rest))  # a thinned test that went on to run every query that matters
             elif kind == "T":
                 index, _, cpu = rest.partition(" ")
                 self.times[int(index)] = float(cpu)

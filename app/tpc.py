@@ -74,10 +74,30 @@ def size(test_id, module):
     return len(list(module.load_sql_fixture_pairs(FIXTURES[attr])))
 
 
-def thin_executor(module, selection):
+class _Late:
+    """Class attribute holding a query list that is chosen when the test first
+    asks for it: the short list, or the full one if `widen()` says so."""
+
+    def __init__(self, short, widen):
+        self._short = short
+        self._widen = widen
+        self._value = None
+
+    def __get__(self, instance, owner):
+        if self._value is None:
+            wider = self._widen()
+            self._value = self._short if wider is None else wider
+        return self._value
+
+
+def thin_executor(module, selection, wider=None):
     """selection: test id -> set of query positions (0-based) to keep.
+    wider: test id -> (larger set of positions, should(), done()): when the
+    test starts and should() is true, it runs the larger set instead, and
+    done() is called.
     Must be called before the class fixture runs."""
     cls = module.TestExecutor
+    wider = wider or {}
     keep = {}
     needs_rows = {}
     for test_id, positions in selection.items():
@@ -85,28 +105,66 @@ def thin_executor(module, selection):
         keep.setdefault(attr, set()).update(positions)
         if schema:
             needs_rows[attr] = schema
+    late = {}
+    for test_id, (positions, should, done) in wider.items():
+        attr = TARGETS[test_id][3]
+        if sum(1 for t in selection if TARGETS[t][3] == attr) == 1:  # no other test shares the list
+            late[attr] = (set(positions), should, done)
     shim = _SomeTablesCsv(getattr(module.csv, "_real", module.csv), set())
     module.csv = shim
     original = cls.setUpClass.__func__
 
-    def setUpClass(klass):
+    def tables_of(kept):
         # which tables do the kept queries mention?  Decided from the fixture
         # text, before the tables are read.
         wanted = set()
         for attr, schema_name in needs_rows.items():
             pairs = list(module.load_sql_fixture_pairs(FIXTURES[attr]))
             schema = getattr(module, schema_name)
-            for position in keep.get(attr, ()):
+            for position in kept.get(attr, ()):
                 if position < len(pairs):
                     sql = pairs[position][1].lower()
                     for table in schema:
                         if re.search(r"\b%s\b" % re.escape(table.lower()), sql):
                             wanted.add(table)
-        shim.full = wanted
+        return wanted
+
+    def thinned(pairs, positions):
+        return [pair if i in positions else ({}, "SELECT 1", "SELECT 1") for i, pair in enumerate(pairs)]
+
+    def setUpClass(klass):
+        shim.full = tables_of(keep)
         original(klass)
         for attr, positions in keep.items():
-            pairs = getattr(klass, attr)
-            setattr(klass, attr, [pair if i in positions else ({}, "SELECT 1", "SELECT 1") for i, pair in enumerate(pairs)])
+            short = thinned(getattr(klass, attr), positions)
+            if attr not in late:
+                setattr(klass, attr, short)
+                continue
+
+            def widen(attr=attr):
+                more, should, done = late[attr]
+                if not should():
+                    return None
+                # Load again with the tables the larger set needs.  Objects the
+                # test may already hold (the table dicts) are refilled in place.
+                held = {name: value for name, value in vars(klass).items() if isinstance(value, dict)}
+                shim.full = tables_of(dict(keep, **{attr: more}))
+                original(klass)
+                for name, old in held.items():
+                    fresh = vars(klass).get(name)
+                    if isinstance(fresh, dict) and fresh is not old:
+                        old.clear()
+                        old.update(fresh)
+                        setattr(klass, name, old)
+                for other, kept in keep.items():
+                    if other != attr:
+                        setattr(klass, other, thinned(getattr(klass, other), kept))
+                value = thinned(getattr(klass, attr), more)
+                setattr(klass, attr, value)
+                done()
+                return value
+
+            setattr(klass, attr, _Late(short, widen))
 
     cls.setUpClass = classmethod(setUpClass)
 
@@ -115,10 +173,10 @@ def thin_generator(module, positions):
     module.Dialects = [name for i, name in enumerate(module.Dialects) if i in positions]
 
 
-def thin(modules, selection):
+def thin(modules, selection, wider=None):
     """modules: module name -> imported module; selection: test id -> positions."""
     executor = {t: p for t, p in selection.items() if TARGETS[t][0] == "tests.test_executor"}
     if executor:
-        thin_executor(modules["tests.test_executor"], executor)
+        thin_executor(modules["tests.test_executor"], executor, wider)
     if GENERATOR_MEMORY in selection:
         thin_generator(modules["tests.test_generator"], selection[GENERATOR_MEMORY])

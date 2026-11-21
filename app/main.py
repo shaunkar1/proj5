@@ -394,8 +394,16 @@ def main(out):
                     plan.probe_cpu[n] = Q[method][2] + sum(Q[method][1][k] for k in chosen)
                 else:
                     continue
-                query_entries.append((n, runner.PROXY + "query:%s|%s" % (method, ",".join(map(str, sorted(chosen))))))
+                spec = "query:%s|%s" % (method, ",".join(map(str, sorted(chosen))))
                 expected = Q[method][2] + sum(Q[method][1][k] for k in chosen)
+                if duck_ok and not plan.exact[n] and method == tpc.EXECUTOR + "test_execute_tpcds":
+                    # A probe that starts after a cheaper executor test has failed
+                    # runs every query that can see the patch instead: the test
+                    # would be selected on that evidence anyway, and about half
+                    # the time it turns out to pass.
+                    spec += "|" + ",".join(map(str, sorted(positions)))
+                    expected = 1.5 * total + 2.0  # room for the second load of the tables
+                query_entries.append((n, runner.PROXY + spec))
                 query_budget[n] = max(10.0, 3.0 * expected + 5.0) * SLACK
             entries = [(n, id_of[n]) for n in light]
             entries += [(n, runner.PROXY + test_id) for n, test_id in sorted(plan.proxy.items())]
@@ -485,6 +493,8 @@ def main(out):
                 exact = getattr(plan, "exact", {}).get(n)
                 if exact:
                     continue  # ran in full and passed (a failure is already selected)
+                if exact is False and job is not None and n in job.exact and n in job.passed:
+                    continue  # the probe turned into a full run, which passed
                 if exact is False:
                     # probed and clean: left out unless many cheaper tests fail,
                     # or the probe itself ran far slower than it should
